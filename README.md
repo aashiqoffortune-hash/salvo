@@ -2,6 +2,8 @@
 
 Spray one or many credentials across **every NetExec protocol at once** and read the result as a matrix.
 
+![salvo: one credential fanned out across every NetExec protocol, read back as a single matrix](sketch.svg)
+
 `nxc` takes one protocol per invocation. Testing a credential properly means running it eight times and reading eight scrollbacks. `salvo` runs them concurrently and prints one table — with an honest verdict in every cell.
 
 ```
@@ -15,6 +17,7 @@ host                       smb   winrm     wmi   mssql    ldap     rdp     ssh  
   exec   = code execution, NOT admin - check the smb column before assuming
   ok     = authenticated    VALID* = password correct, this access path blocked
   ?      = cannot tell, retest elsewhere    . = refused    - = no service / no answer
+  !CMD   = nxc REJECTED the command salvo built - this cell was never tested
 ```
 
 Stdlib only. No pip, no virtualenv, no dependencies beyond `nxc` itself.
@@ -205,3 +208,59 @@ Built on [NetExec](https://github.com/Pennyw0rth/NetExec) by @NeffIsBack, @MJHal
 ## License
 
 MIT
+
+---
+
+## Correctness notes
+
+`salvo` builds NetExec command lines, so it has to know exactly which flags
+each nxc protocol defines. Getting that wrong does not produce an error you can
+see — it produces a blank cell that reads as *"nothing listening there."*
+
+The capability tables at the top of `salvo.py` are verified against
+`nxc/protocols/<proto>/proto_args.py` upstream:
+
+| flag | protocols that define it |
+|---|---|
+| `-d` / `--domain` | smb, winrm, wmi, mssql, ldap, rdp |
+| `--local-auth` | smb, winrm, wmi, mssql, rdp — **not ldap** |
+| `-H` / `--hash` | smb, winrm, wmi, mssql, ldap, rdp |
+
+`ssh`, `ftp`, `nfs` and `vnc` have no domain concept at all. If a domain is
+supplied, salvo withholds `-d` for those protocols and says so after the matrix,
+because a bare username is a different test from a domain one.
+
+nxc's global `--timeout` is deprecated upstream and silently ignored. salvo emits
+the per-protocol flag instead — `--smb-timeout`, `--http-timeout`, `--rpc-timeout`,
+`--mssql-timeout`, `--ldap-timeout`, `--rdp-timeout`, `--ssh-timeout`,
+`--nfs-timeout`. This matters over a tunnel: nxc's own defaults are 2s for SMB
+and 3s for LDAP, short enough to time out on latency and report a live host as
+dead. `ftp` and `vnc` expose no timeout flag.
+
+### Keeping it honest as NetExec moves
+
+```bash
+salvo --selftest          # parser vs known nxc output formats
+salvo --check-nxc -P all  # capability tables vs the nxc you have installed
+```
+
+Run both after any NetExec upgrade. If a job is ever rejected mid-run, salvo
+marks the cell `!CMD`, then calls `nxc <proto> --help` itself and names the
+offending flag — a broken command is never allowed to look like a closed port.
+
+## Operational security
+
+Eight protocols against a whole subnet is a burst of failed logons from one
+source address, and it will be flagged. `--stealth` turns it into a trickle:
+one nxc process at a time, one thread, `--jitter 3-7` inside each process and a
+5-second gap between them. nxc's own `--jitter` only spaces attempts *within* a
+process; `--job-delay` is what spaces salvo's processes apart.
+
+## Pivoting
+
+`--proxychains` wraps each nxc invocation for chisel or `ssh -D` SOCKS setups,
+caps threads at 5 and raises timeouts, because proxychains' libc hooking drops
+connections under concurrency and a dropped connection renders as a false `-`.
+
+With **ligolo-ng** you do not need this — the route is in the kernel and nxc
+reaches the target directly.

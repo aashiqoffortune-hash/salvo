@@ -33,7 +33,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -85,8 +85,35 @@ DEFAULT_PW_PROTOCOLS = ["smb", "winrm", "wmi", "mssql", "ldap", "rdp", "ssh", "f
 # protocols that accept -H (pass-the-hash). ssh/ftp/nfs/vnc cannot PTH.
 HASH_CAPABLE = {"smb", "winrm", "wmi", "mssql", "ldap", "rdp"}
 
-# protocols that accept --local-auth
-LOCAL_AUTH_CAPABLE = {"smb", "winrm", "wmi", "mssql", "ldap", "rdp"}
+# Protocols whose nxc sub-parser actually defines -d/--domain.
+# ssh, ftp, nfs and vnc have NO domain concept and NO -d argument. Passing it
+# makes argparse exit with a usage error before a single packet is sent, the
+# job produces nothing parseable, and the cell renders as '-' - which reads as
+# "port closed" when the truth is "salvo built a broken command".
+# Verified against nxc/protocols/<proto>/proto_args.py upstream.
+DOMAIN_CAPABLE = {"smb", "winrm", "wmi", "mssql", "ldap", "rdp"}
+
+# Protocols whose nxc sub-parser defines --local-auth.
+# LDAP is the trap: it takes -d but NOT --local-auth, because a directory bind
+# is inherently domain-scoped. It was in this set and it should not have been.
+LOCAL_AUTH_CAPABLE = {"smb", "winrm", "wmi", "mssql", "rdp"}
+
+# nxc's global --timeout is DEPRECATED and does nothing. Its own help text says
+# so: "no longer used, replaced by per-protocol timeouts". Every protocol now
+# carries its own flag, with defaults that are brutally short over a tunnel:
+#   smb 2s | wmi(rpc) 2s | ldap 3s | mssql 5s | rdp 5s | nfs 5s | winrm 10s | ssh 15s
+# ftp and vnc expose no timeout flag at all.
+TIMEOUT_FLAG = {
+    "smb":   "--smb-timeout",
+    "winrm": "--http-timeout",
+    "wmi":   "--rpc-timeout",
+    "mssql": "--mssql-timeout",
+    "ldap":  "--ldap-timeout",
+    "rdp":   "--rdp-timeout",
+    "ssh":   "--ssh-timeout",
+    "nfs":   "--nfs-timeout",
+    # ftp, vnc: none exists
+}
 
 # default nxc port per protocol, used only for the follow-up command hints
 DEFAULT_PORT = {
@@ -115,6 +142,7 @@ INVALID = "INVALID"            # confirmed wrong credential
 LOCKED = "LOCKED"              # account lockout - stop everything
 NO_SERVICE = "NOSVC"           # port closed / no such service on that host
 ERROR = "ERROR"                # nxc itself failed
+USAGE = "USAGE"                # salvo built a command nxc rejected - OUR bug, not the target's
 
 # What nxc's "Pwn3d!" actually proves, per protocol. This is not cosmetic:
 #   smb    - Pwn3d means write access to ADMIN$/C$. That IS local admin.
@@ -149,6 +177,7 @@ GLYPH = {
     LOCKED: "LOCK!",
     NO_SERVICE: "-",
     ERROR: "err",
+    USAGE: "!CMD",
 }
 
 # ordering for "which status wins" when one host+protocol produces several lines
@@ -159,6 +188,7 @@ SEVERITY = {
     CRED_OK_ACCESS_NO: 80,
     LOCKED: 75,
     INCONCLUSIVE: 50,
+    USAGE: 30,
     ERROR: 20,
     INVALID: 10,
     NO_SERVICE: 0,
@@ -201,6 +231,8 @@ STATUS_MAP = [
 # WinRM is the big one: a valid account not in Remote Management Users looks
 # identical to a wrong password.
 AMBIGUOUS_BARE_FAILURE = {"winrm", "rdp", "wmi", "ldap", "mssql"}
+
+LITERAL_IP = re.compile(r"^[0-9]{1,3}(?:\.[0-9]{1,3}){3}$")
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 LINE_RE = re.compile(
@@ -481,27 +513,55 @@ class Runner:
         self.seen_domains = set()   # domains the targets advertised themselves
         self.logdir = args.logdir
         self.skipped = 0
+        self.domain_dropped = set()   # protocols where -d was withheld (no such flag)
+        self.job_failures = []        # (proto, user, returncode, tail) - nxc refused to run
+        self.unparsed = {}            # proto -> count of output lines LINE_RE did not match
+        self.parsed = {}              # proto -> count of output lines it did match
 
     def build_cmd(self, cred, proto, targets):
         """
         nxc generic options come BEFORE the protocol. Protocol options after.
         Getting that order wrong is the number one nxc syntax mistake.
         """
-        cmd = [self.args.nxc_bin]
+        cmd = []
+        if self.args.proxychains:
+            # nxc has no proxy flag of its own; the standard route is to run it
+            # under proxychains. -q keeps its chatter out of the parsed stream.
+            cmd += [self.args.proxychains_bin, "-q"]
+
+        cmd += [self.args.nxc_bin]
         cmd += ["-t", str(self.args.nxc_threads)]           # nxc's own per-target concurrency
-        if self.args.nxc_timeout:
-            cmd += ["--timeout", str(self.args.nxc_timeout)]
         if self.args.jitter:
             cmd += ["--jitter", self.args.jitter]
         cmd += ["--no-progress"]                            # progress bar corrupts parsing
         cmd += [proto]
         cmd += list(targets)
+
+        # ---- per-protocol timeout ----------------------------------------
+        # The global --timeout is deprecated upstream and silently ignored.
+        # Only emit the flag this protocol actually owns.
+        if self.args.nxc_timeout and proto in TIMEOUT_FLAG:
+            cmd += [TIMEOUT_FLAG[proto], str(self.args.nxc_timeout)]
+
         cmd += ["-u", cred.user]
         cmd += ["-H" if cred.is_hash else "-p", cred.secret]
-        if cred.local and proto in LOCAL_AUTH_CAPABLE:
-            cmd += ["--local-auth"]
-        elif cred.domain and not cred.local:
-            cmd += ["-d", cred.domain]
+
+        # ---- auth mode, whitelisted per protocol -------------------------
+        # Never send a flag the sub-parser does not define. The cost of getting
+        # this wrong is not an error message, it is a silent '-' in the matrix.
+        if cred.local:
+            if proto in LOCAL_AUTH_CAPABLE:
+                cmd += ["--local-auth"]
+            # ssh/ftp/nfs/vnc: no domain concept, so local IS the only mode.
+            # Send nothing and let it run.
+        elif cred.domain:
+            if proto in DOMAIN_CAPABLE:
+                cmd += ["-d", cred.domain]
+            else:
+                # Record it so the run can say so afterwards rather than
+                # letting the user believe the domain cred was tested here.
+                self.domain_dropped.add(proto)
+
         cmd += ["--continue-on-success"]                    # without this you stop at hit one
         return cmd
 
@@ -517,6 +577,12 @@ class Runner:
     def run_one(self, cred, proto, targets, sig):
         if self.abort.is_set():
             return
+        if self.args.job_delay:
+            # Spaces salvo's own processes apart. nxc --jitter cannot do this;
+            # it only delays attempts within a single process.
+            time.sleep(self.args.job_delay)
+            if self.abort.is_set():
+                return
         cmd = self.build_cmd(cred, proto, targets)
         logpath = self.logpath_for(cred, proto)
         job_hits = []
@@ -537,6 +603,7 @@ class Runner:
         # log rather than growing it
         logfh = open(logpath, "w") if logpath else None
         clean = False
+        tail = deque(maxlen=6)   # last few lines, for when nxc refuses to run
         try:
             for raw in proc.stdout:
                 if logfh:
@@ -544,9 +611,17 @@ class Runner:
                 line = strip_ansi(raw.rstrip("\n"))
                 if not line.strip():
                     continue
+                tail.append(line.strip())
                 m = LINE_RE.match(line)
                 if not m:
+                    # Format-drift detector. nxc's human-readable output is the
+                    # only interface salvo has; if upstream changes its column
+                    # layout this counter is what says so out loud.
+                    with self.lock:
+                        self.unparsed[proto] = self.unparsed.get(proto, 0) + 1
                     continue
+                with self.lock:
+                    self.parsed[proto] = self.parsed.get(proto, 0) + 1
                 ip = m.group("ip")
                 host = m.group("host")
                 rest = m.group("rest").strip()
@@ -590,6 +665,25 @@ class Runner:
                 proc.wait(timeout=5)
             except Exception:
                 proc.kill()
+
+        # ---- a job that produced no verdict at all ---------------------------
+        # Three different facts used to collapse into the same '-' cell:
+        #   the port is closed, nxc crashed, and salvo built a command nxc
+        #   rejected. Only the first is a statement about the target. Separate
+        #   them here, or an argparse error reads as "nothing listening".
+        if (not job_hits and not self.abort.is_set()
+                and proc.returncode not in (0, None)):
+            msg = " | ".join(t for t in tail) or "no output"
+            with self.lock:
+                self.job_failures.append((proto, cred.user, proc.returncode, msg))
+            note = "nxc exited {} without producing a single result line".format(proc.returncode)
+            for t in targets:
+                if LITERAL_IP.match(t):
+                    self.record(Hit(cred, proto, t, DEFAULT_PORT.get(proto, 0),
+                                    t, USAGE, note, msg[:200]))
+            if not any(LITERAL_IP.match(t) for t in targets):
+                self.record(Hit(cred, proto, "-", 0, "-", USAGE, note, msg[:200]))
+            return   # do NOT mark done - a rejected command must be retried
 
         # Only a clean, unaborted, zero-exit job is recorded as done. Anything
         # else stays unrecorded so the next run retries it.
@@ -641,9 +735,80 @@ class Runner:
                           "meaningless against Windows OpenSSH. Expect a standard "
                           "user in cmd.exe.")
 
+    def probe_flags(self, proto):
+        """
+        Ask nxc itself which flags this protocol accepts.
+
+        The hardcoded capability tables above are a snapshot of upstream, and a
+        snapshot goes stale. This is the escape hatch: it is only paid for when
+        something has already gone wrong, and it turns "the ssh column is
+        empty" into "nxc ssh has no -d".
+        """
+        try:
+            r = subprocess.run([self.args.nxc_bin, proto, "--help"],
+                               capture_output=True, text=True, timeout=60)
+        except Exception:
+            return None
+        help_text = (r.stdout or "") + (r.stderr or "")
+        if not help_text.strip():
+            return None
+        return {
+            "-d": (" -d " in help_text or "--domain" in help_text),
+            "--local-auth": ("--local-auth" in help_text),
+            "-H": (" -H " in help_text or "--hash" in help_text),
+            "timeout": TIMEOUT_FLAG.get(proto, "") in help_text if proto in TIMEOUT_FLAG else None,
+        }
+
+    def diagnose_failures(self):
+        """
+        For every protocol whose job nxc refused to run, work out which flag
+        salvo sent that the protocol does not define, and say so by name.
+        """
+        out = []
+        for proto in sorted({p for p, _u, _rc, _m in self.job_failures}):
+            supported = self.probe_flags(proto)
+            if supported is None:
+                out.append("  {}: could not run 'nxc {} --help' to diagnose".format(proto, proto))
+                continue
+            sent = []
+            if self.args.domain and not self.args.local_auth and proto in DOMAIN_CAPABLE:
+                sent.append("-d")
+            if self.args.local_auth and proto in LOCAL_AUTH_CAPABLE:
+                sent.append("--local-auth")
+            bad = [f for f in sent if supported.get(f) is False]
+            if bad:
+                out.append("  {}: salvo sent {} but 'nxc {}' does not define it. "
+                           "Remove '{}' from the capability table at the top of this file."
+                           .format(proto, " and ".join(bad), proto, proto))
+            else:
+                out.append("  {}: flags look valid - the failure is nxc itself, "
+                           "not the command. Check the log.".format(proto))
+        return out
+
     def advisories(self):
         """Things worth saying once, after the matrix, that are not verdicts."""
         out = []
+
+        # A domain credential tested over a protocol with no domain concept is
+        # not the same test. Say so rather than letting the column stand.
+        if self.domain_dropped:
+            out.append(
+                "-d was NOT sent to {} - those protocols have no domain argument, "
+                "so nxc authenticated the bare username with no '{}\\' prefix. "
+                "Those cells answer a different question from the domain columns; "
+                "on a Windows host they usually resolve to the LOCAL account of "
+                "the same name."
+                .format(", ".join(sorted(self.domain_dropped)), self.args.domain))
+
+        # Format drift: nxc printed lines, salvo understood none of them.
+        for proto, n in sorted(self.unparsed.items()):
+            if n >= 3 and self.parsed.get(proto, 0) == 0:
+                out.append(
+                    "{}: nxc produced {} output line(s) and salvo parsed NONE of them. "
+                    "Either the command failed or NetExec's output format has changed. "
+                    "Re-run with --logdir and read the raw log before trusting this row."
+                    .format(proto, n))
+
         given = {c for c in [self.args.domain] if c}
         undeclared = {d for d in self.seen_domains if d and d.lower() not in
                       {g.lower() for g in given}}
@@ -662,7 +827,7 @@ class Runner:
         """
         counted = {}
         for (_ck, _ip, _p), h in collapse(self.hits).items():
-            if h.status in (NO_SERVICE, ERROR):
+            if h.status in (NO_SERVICE, ERROR, USAGE):
                 continue
             counted[h.cred.user] = counted.get(h.cred.user, 0) + 1
         return counted
@@ -677,6 +842,11 @@ class Runner:
             for proto in protocols:
                 if cred.is_hash and proto not in HASH_CAPABLE:
                     continue  # cannot pass-the-hash over ssh/ftp/nfs/vnc
+                if cred.local and proto == "ldap":
+                    # nxc ldap has no --local-auth: a directory bind is always
+                    # domain-scoped. Running it anyway would spend a logon to
+                    # learn nothing, and print an INVALID that is not true.
+                    continue
                 sig = job_signature(cred, proto, targets)
                 if self.state and self.state.is_done(sig):
                     self.skipped += 1
@@ -733,6 +903,7 @@ def fmt_live(hit):
         INVALID: "[  -  ]",
         NO_SERVICE: "[ nosvc]",
         ERROR: "[ err ]",
+        USAGE: "[!CMD ]",
     }[hit.status]
     return "{:8} {:6} {:<16} {:<16} {}".format(
         tag, hit.proto, hit.ip, hit.host[:16], hit.cred.user
@@ -831,6 +1002,7 @@ def render_matrix(hits, protocols, markdown=False):
     out.append("  exec   = code execution, NOT admin - check the smb column before assuming")
     out.append("  ok     = authenticated    VALID* = password correct, this access path blocked")
     out.append("  ?      = cannot tell, retest elsewhere    . = refused    - = no service / no answer")
+    out.append("  !CMD   = nxc REJECTED the command salvo built - this cell was never tested")
     out.append("  <      = this host answered on at least one protocol")
     out.append("")
     return "\n".join(out) + "\n"
@@ -979,6 +1151,101 @@ def inconclusive_report(hits):
 # CLI
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Parser self-test
+# ---------------------------------------------------------------------------
+
+# Real nxc output shapes and the verdict each MUST produce. This is the
+# regression net under the only interface salvo has - if NetExec changes its
+# column layout, this fails before a live run silently reports nothing.
+SELFTEST = [
+    ("smb",   "SMB         192.168.100.25  445    WEB01            [*] Windows 10.0 Build 19044 x64 (name:WEB01) (domain:corp.local) (signing:False) (SMBv1:False)", None),
+    ("smb",   "SMB         192.168.100.25  445    WEB01            [+] corp.local\\jdoe:Password123! (Pwn3d!)", ADMIN),
+    ("smb",   "SMB         192.168.100.25  445    WEB01            [+] corp.local\\jdoe:Password123!", VALID),
+    ("smb",   "SMB         192.168.100.25  445    WEB01            [-] corp.local\\jdoe:Password123! STATUS_LOGON_FAILURE", INVALID),
+    ("smb",   "SMB         192.168.100.25  445    WEB01            [-] corp.local\\jdoe:Password123! STATUS_ACCOUNT_LOCKED_OUT", LOCKED),
+    ("smb",   "SMB         192.168.100.25  445    WEB01            [-] corp.local\\jdoe:Password123! STATUS_LOGON_TYPE_NOT_GRANTED", CRED_OK_ACCESS_NO),
+    ("winrm", "WINRM       192.168.100.25  5985   WEB01            [+] corp.local\\jdoe:Password123! (Pwn3d!)", EXEC),
+    ("winrm", "WINRM       192.168.100.25  5985   WEB01            [-] corp.local\\jdoe:Password123!", INCONCLUSIVE),
+    ("ssh",   "SSH         192.168.100.25  22     192.168.100.25   [+] jdoe:Password123! (Pwn3d!)", EXEC),
+    ("ssh",   "SSH         192.168.100.25  22     192.168.100.25   [-] jdoe:Password123!", INVALID),
+    ("mssql", "MSSQL       192.168.100.26  1433   SRV22            [+] corp.local\\sa:Passw0rd (Pwn3d!)", ADMIN),
+    ("ldap",  "LDAP        192.168.100.10  389    DC01             [-] corp.local\\jdoe:Password123! STATUS_ACCESS_DENIED", INCONCLUSIVE),
+]
+
+
+def selftest():
+    """Prove the line parser and the verdict table still agree with reality."""
+    bad = 0
+    for proto, line, expect in SELFTEST:
+        m = LINE_RE.match(strip_ansi(line))
+        if not m:
+            print("  FAIL  regex did not match: {}".format(line[:70]))
+            bad += 1
+            continue
+        rest = m.group("rest").strip()
+        host = m.group("host")
+        if host.startswith("["):
+            rest = (host + " " + rest).strip()
+        status, _note = classify(proto, rest)
+        if status != expect:
+            print("  FAIL  {:6} expected {} got {}  <- {}".format(
+                proto, expect, status, line[:60]))
+            bad += 1
+        else:
+            print("  ok    {:6} {:9} {}".format(proto, str(expect), line[:52]))
+    print("")
+    if bad:
+        print("[!] {} of {} parser checks FAILED. NetExec's output format has "
+              "probably changed - fix LINE_RE / STATUS_MAP before you trust a "
+              "live run.".format(bad, len(SELFTEST)))
+        return 1
+    print("[*] all {} parser checks passed.".format(len(SELFTEST)))
+    return 0
+
+
+def check_nxc(nxc_bin, protocols):
+    """
+    Compare salvo's capability tables against what the installed nxc really
+    accepts. Run this after any NetExec upgrade.
+    """
+    print("\n  protocol   -d      --local-auth   timeout flag")
+    print("  " + "-" * 56)
+    drift = []
+    for proto in protocols:
+        try:
+            r = subprocess.run([nxc_bin, proto, "--help"],
+                               capture_output=True, text=True, timeout=60)
+            h = (r.stdout or "") + (r.stderr or "")
+        except Exception as e:
+            print("  {:<10} could not run: {}".format(proto, e))
+            continue
+        has_d = (" -d " in h or "--domain" in h)
+        has_la = ("--local-auth" in h)
+        tflag = TIMEOUT_FLAG.get(proto)
+        has_t = (tflag in h) if tflag else False
+        print("  {:<10} {:<7} {:<14} {}".format(
+            proto,
+            "yes" if has_d else "no",
+            "yes" if has_la else "no",
+            (tflag + (" ok" if has_t else " MISSING")) if tflag else "none"))
+        if has_d != (proto in DOMAIN_CAPABLE):
+            drift.append("DOMAIN_CAPABLE is wrong for {}".format(proto))
+        if has_la != (proto in LOCAL_AUTH_CAPABLE):
+            drift.append("LOCAL_AUTH_CAPABLE is wrong for {}".format(proto))
+        if tflag and not has_t:
+            drift.append("TIMEOUT_FLAG[{}] = {} no longer exists".format(proto, tflag))
+    print("")
+    if drift:
+        print("[!] salvo's tables disagree with your nxc:")
+        for d in drift:
+            print("      " + d)
+        print("    Fix the sets at the top of salvo.py before your next run.\n")
+        return 1
+    print("[*] capability tables match the installed NetExec.\n")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="salvo",
@@ -1007,6 +1274,16 @@ examples
   # show me the nxc commands, run nothing
   salvo 192.168.100.0/24 -u jdoe -p 'Password123!' -d corp.local --dry-run
 
+  # low and slow - one protocol at a time, spaced, for a monitored network
+  salvo 192.168.100.0/24 -u jdoe -p 'Password123!' -d corp.local --stealth
+
+  # through a chisel / ssh -D SOCKS proxy (not needed with ligolo-ng)
+  salvo 172.16.5.0/24 -u jdoe -p 'Password123!' -d corp.local --proxychains
+
+  # after upgrading NetExec: does salvo still agree with it?
+  salvo --check-nxc -P all
+  salvo --selftest
+
 idempotence
 -----------
   Same arguments in, same bytes out - results are sorted, never printed in
@@ -1023,7 +1300,7 @@ creds.txt format
 """,
     )
 
-    ap.add_argument("targets", nargs="+",
+    ap.add_argument("targets", nargs="*",
                     help="IPs, ranges, CIDRs, hostnames, or a file of them - anything nxc accepts")
 
     g = ap.add_argument_group("credentials")
@@ -1046,8 +1323,22 @@ creds.txt format
     g.add_argument("--nxc-timeout", type=int, default=15,
                    help="nxc --timeout seconds (default 15)")
     g.add_argument("--jitter", help="nxc --jitter value, e.g. 2 or 1-3")
+    g.add_argument("--job-delay", type=float, default=0.0, metavar="SECS",
+                   help="sleep this long before each nxc process starts. nxc's "
+                        "own --jitter only spaces attempts INSIDE one process; "
+                        "this is the only thing that spaces salvo's processes apart")
     g.add_argument("--slow", action="store_true",
-                   help="tunnel preset: parallel 3, nxc-threads 5, timeout 30")
+                   help="tunnel preset: parallel 3, nxc-threads 5, per-protocol timeout 30")
+    g.add_argument("--stealth", action="store_true",
+                   help="low and slow: parallel 1, nxc-threads 1, jitter 3-7, "
+                        "job-delay 5, timeout 30. One protocol at a time, in order")
+
+    g = ap.add_argument_group("pivoting")
+    g.add_argument("--proxychains", action="store_true",
+                   help="run every nxc under proxychains (for chisel / ssh -D SOCKS). "
+                        "NOT needed with ligolo-ng, which routes in the kernel")
+    g.add_argument("--proxychains-bin", default="proxychains4",
+                   help="proxychains binary (default proxychains4)")
 
     g = ap.add_argument_group("output")
     g.add_argument("--markdown", action="store_true", help="emit the matrix as an Obsidian table")
@@ -1061,6 +1352,11 @@ creds.txt format
     g.add_argument("--no-lockout-guard", action="store_true",
                    help="do NOT abort the run when a lockout is seen")
     g.add_argument("--nxc-bin", default="nxc", help="path to nxc (default: nxc on PATH)")
+    g.add_argument("--selftest", action="store_true",
+                   help="run the output parser against known nxc line formats and exit")
+    g.add_argument("--check-nxc", action="store_true",
+                   help="ask the installed nxc which flags each protocol accepts and "
+                        "compare against salvo's tables. Run after any NetExec upgrade")
 
     g = ap.add_argument_group("resume")
     g.add_argument("--state", metavar="FILE",
@@ -1074,6 +1370,18 @@ creds.txt format
 
     args = ap.parse_args()
 
+    if args.selftest:
+        print("\n[*] salvo parser self-test\n")
+        sys.exit(selftest())
+
+    if args.check_nxc:
+        protos = (list(ALL_PROTOCOLS) if args.protocols.strip().lower() == "all"
+                  else [x.strip().lower() for x in args.protocols.split(",") if x.strip()])
+        sys.exit(check_nxc(args.nxc_bin, [x for x in protos if x in ALL_PROTOCOLS]))
+
+    if not args.targets:
+        sys.exit("[!] no targets given.")
+
     if args.forget:
         if not args.state:
             sys.exit("[!] --forget needs --state FILE")
@@ -1085,6 +1393,34 @@ creds.txt format
 
     if args.slow:
         args.parallel, args.nxc_threads, args.nxc_timeout = 3, 5, 30
+
+    if args.stealth:
+        # Eight protocols fired at once across a subnet is a wall of failed
+        # logons from one source address. This makes it a trickle instead:
+        # one process, one thread, spaced apart at both levels.
+        args.parallel, args.nxc_threads, args.nxc_timeout = 1, 1, 30
+        args.jitter = args.jitter or "3-7"
+        args.job_delay = args.job_delay or 5.0
+        print("[*] --stealth: 1 process at a time, 1 nxc thread, jitter {}, "
+              "{:.0f}s between jobs.".format(args.jitter, args.job_delay))
+        print("    This is slow ON PURPOSE. A full 8-protocol sweep of one host "
+              "will take minutes, not seconds.\n")
+
+    if args.proxychains:
+        if not shutil.which(args.proxychains_bin):
+            sys.exit("[!] '{}' not found on PATH.".format(args.proxychains_bin))
+        if args.nxc_threads > 5:
+            # proxychains hooks libc socket calls and does not survive high
+            # concurrency intact; connections get dropped and misread as '-'.
+            args.nxc_threads = 5
+            print("[*] --proxychains: capped nxc-threads at 5. Its socket "
+                  "hooking is unreliable under heavy concurrency, and a dropped "
+                  "connection here would render as a false '-'.")
+        if not args.nxc_timeout or args.nxc_timeout < 20:
+            args.nxc_timeout = 20
+            print("[*] --proxychains: raised per-protocol timeout to 20s to "
+                  "absorb SOCKS latency.")
+        print("")
 
     if not args.dry_run and not shutil.which(args.nxc_bin):
         sys.exit("[!] '{}' not found on PATH. Install NetExec or pass --nxc-bin.".format(args.nxc_bin))
@@ -1148,6 +1484,9 @@ creds.txt format
         if skipped:
             print("[*] hash credentials cannot pass-the-hash over: {} - skipping those jobs"
                   .format(", ".join(skipped)))
+    if any(c.local for c in creds) and "ldap" in protocols:
+        print("[*] ldap has no --local-auth in nxc (a bind is always domain-scoped) "
+              "- skipping the local-auth ldap job rather than spending a logon on it")
     if "vnc" in protocols:
         print("[*] note: nxc vnc authenticates with a password only, the username is ignored")
 
@@ -1189,7 +1528,6 @@ creds.txt format
     # which member server you authenticated against. So the bill is
     # protocols x hosts, not protocols. Counted on the jobs that will ACTUALLY
     # run, so a resumed run does not warn about attempts it is not making.
-    LITERAL_IP = re.compile(r"^[0-9]{1,3}(?:\.[0-9]{1,3}){3}$")
     exact_hosts = (len(args.targets)
                    if all(LITERAL_IP.match(t) for t in args.targets) else None)
 
@@ -1239,6 +1577,18 @@ creds.txt format
         for m in moves:
             print(m)
         print("")
+
+    if runner.job_failures:
+        print("!" * 70)
+        print("  {} job(s) never ran - nxc rejected the command salvo built.".format(
+            len(runner.job_failures)))
+        print("  Those cells are marked !CMD. They are NOT a statement about the target.")
+        for proto, user, rc, msg in sorted(runner.job_failures):
+            print("    {:6} {:<20} exit {}  {}".format(proto, user, rc, msg[:90]))
+        print("\n  asking nxc which flag it objected to:")
+        for line in runner.diagnose_failures():
+            print(line)
+        print("!" * 70 + "\n")
 
     for note in runner.advisories():
         print("[!] " + note)

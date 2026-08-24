@@ -108,11 +108,10 @@ TIMEOUT_FLAG = {
     "winrm": "--http-timeout",
     "wmi":   "--rpc-timeout",
     "mssql": "--mssql-timeout",
-    "ldap":  "--ldap-timeout",
     "rdp":   "--rdp-timeout",
     "ssh":   "--ssh-timeout",
     "nfs":   "--nfs-timeout",
-    # ftp, vnc: none exists
+    # ftp, vnc, ldap: nxc defines no per-protocol timeout flag for these
 }
 
 # default nxc port per protocol, used only for the follow-up command hints

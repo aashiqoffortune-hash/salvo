@@ -99,12 +99,20 @@ not left to infer it from an absence.
 ## Install
 
 ```bash
-pipx install salvo-nxc     # or: pip install --user salvo-nxc
+pipx install git+https://github.com/aashiqoffortune-hash/salvo.git
 salvo --help
 ```
 
+or with pip:
+
+```bash
+pip install --user git+https://github.com/aashiqoffortune-hash/salvo.git
+```
+
+Once the package is published to PyPI, `pipx install salvo-nxc` works too.
+
 > **The package is `salvo-nxc`, not `salvo`.** `salvo` on PyPI is an unrelated
-> HTTP load tester by another author. `pip install salvo` gets you that, not
+> HTTP load tester by another author, so `pip install salvo` gets you that, not
 > this. The installed **command** is still `salvo`.
 
 Requires Python 3.8+ and [NetExec](https://github.com/Pennyw0rth/NetExec) on
@@ -114,8 +122,10 @@ asserts it stays that way.
 ### Upgrading
 
 ```bash
-pipx upgrade salvo-nxc     # or: pip install --upgrade salvo-nxc
+pipx install --force git+https://github.com/aashiqoffortune-hash/salvo.git
 ```
+
+or, from PyPI once published, `pipx upgrade salvo-nxc`.
 
 If you installed an earlier salvo by hand — the old instructions said
 `install -m 755 salvo.py ~/bin/salvo` — that copy is still there after an
@@ -126,8 +136,7 @@ run and tells you:
 [!] another 'salvo' is installed and PATH order decides which runs:
       /home/kali/bin/salvo
     this one: /home/kali/.local/bin/salvo
-    If that is an older hand-installed copy, delete it and reinstall:
-        pip install --upgrade --force-reinstall salvo-nxc
+    If that is an older hand-installed copy, delete it and reinstall.
 ```
 
 Running last month's parser against this month's NetExec produces confident,
@@ -370,6 +379,33 @@ and file permissions. Three are worth naming:
   unrecorded so the next run retries it.
 
 CI runs the suite plus `--selftest` on Python 3.8 through 3.13.
+
+## Releasing
+
+Tagging is the whole release:
+
+```bash
+git tag -a v1.0.0 -m "salvo 1.0.0"
+git push origin v1.0.0
+```
+
+`.github/workflows/release.yml` then runs the suite, refuses to continue if the
+tag disagrees with `salvo.__version__`, builds the wheel and sdist, attaches
+them to a GitHub Release, and publishes to PyPI.
+
+PyPI upload uses **Trusted Publishing**, so no API token is stored in this
+repository and there is nothing to leak or rotate. It needs one setup step,
+once, before the first release — on
+[PyPI → Publishing](https://pypi.org/manage/account/publishing/), add a pending
+publisher:
+
+| field | value |
+|---|---|
+| PyPI project name | `salvo-nxc` |
+| Owner | `aashiqoffortune-hash` |
+| Repository name | `salvo` |
+| Workflow name | `release.yml` |
+| Environment name | `pypi` |
 
 ## Credits
 

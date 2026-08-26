@@ -1,0 +1,97 @@
+name: release
+
+# Tag it and it ships:
+#     git tag -a v1.0.0 -m "salvo 1.0.0" && git push origin v1.0.0
+#
+# Publishing to PyPI uses Trusted Publishing (OIDC), so there is no API token
+# in this repository's secrets and nothing to leak or rotate. It needs a
+# one-time setup on PyPI - see the Releasing section of the README.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build and verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # A tag that disagrees with the module is how a release ends up
+      # advertising a version nobody can reproduce.
+      - name: the tag must match salvo.__version__
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          module="$(python -c 'import salvo; print(salvo.__version__)')"
+          test "$tag" = "$module" || {
+            echo "tag is $tag but salvo.__version__ is $module"
+            exit 1
+          }
+
+      - name: the suite must pass before anything ships
+        run: |
+          python -m unittest discover -s tests
+          python salvo.py --selftest
+
+      - name: build
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  github-release:
+    name: attach artifacts to the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      # gh ships on the runner, so this needs no third-party action - one less
+      # thing in the supply chain of a security tool.
+      - name: publish the github release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "salvo ${GITHUB_REF_NAME#v}" \
+            --generate-notes
+
+  pypi:
+    name: publish to PyPI
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/salvo-nxc
+    permissions:
+      id-token: write     # Trusted Publishing. No token is stored in the repo.
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

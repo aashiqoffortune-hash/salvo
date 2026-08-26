@@ -1209,3 +1209,26 @@ class TestScopeCommand(unittest.TestCase):
         r = run_cli("--scope")
         self.assertNotIn("no targets given", r.stdout + r.stderr)
         self.assertIn("authentication only", r.stdout)
+
+
+class TestReleaseWorkflow(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(ROOT, ".github", "workflows", "release.yml")) as fh:
+            self.workflow = fh.read()
+
+    def test_a_tag_that_disagrees_with_the_module_stops_the_release(self):
+        """A release advertising a version nobody can reproduce is worse than none."""
+        self.assertIn("salvo.__version__", self.workflow)
+        self.assertIn("GITHUB_REF_NAME#v", self.workflow)
+
+    def test_the_suite_gates_the_release(self):
+        self.assertIn("python -m unittest discover -s tests", self.workflow)
+
+    def test_pypi_upload_uses_trusted_publishing_not_a_stored_token(self):
+        self.assertIn("id-token: write", self.workflow)
+        self.assertIn("pypa/gh-action-pypi-publish", self.workflow)
+        self.assertNotIn("PYPI_API_TOKEN", self.workflow)
+        self.assertNotIn("password:", self.workflow)
+
+    def test_it_publishes_under_the_right_distribution_name(self):
+        self.assertIn("salvo-nxc", self.workflow)

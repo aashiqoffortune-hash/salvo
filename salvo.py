@@ -1654,8 +1654,7 @@ def warn_about_other_installs():
         sys.stderr.write("      {}\n".format(path))
     sys.stderr.write(
         "    this one: {}\n"
-        "    If that is an older hand-installed copy, delete it and reinstall:\n"
-        "        pip install --upgrade --force-reinstall salvo-nxc\n\n"
+        "    If that is an older hand-installed copy, delete it and reinstall.\n\n"
         .format(_running_path()))
 
 

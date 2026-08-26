@@ -1877,6 +1877,13 @@ creds.txt format
     g.add_argument("--forget", action="store_true",
                    help="delete the --state file and exit")
 
+    # A bare `salvo` should say what it is. Without this it falls through to
+    # the targets guard and answers a first-time user with "no targets given"
+    # and nothing else - true, but useless.
+    if len(sys.argv) == 1:
+        ap.print_help()
+        sys.exit(1)
+
     args = ap.parse_args()
 
     if args.scope:

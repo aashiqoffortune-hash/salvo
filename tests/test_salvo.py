@@ -1160,7 +1160,7 @@ class TestPackaging(unittest.TestCase):
         self.assertIn('requires-python = ">=3.8"', self.toml)
         with open(os.path.join(ROOT, ".github", "workflows", "tests.yml")) as fh:
             workflow = fh.read()
-        for version in ("3.8", "3.9", "3.10", "3.11", "3.12", "3.13"):
+        for version in ("3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"):
             self.assertIn('"{}"'.format(version), workflow)
 
 
@@ -1232,3 +1232,19 @@ class TestReleaseWorkflow(unittest.TestCase):
 
     def test_it_publishes_under_the_right_distribution_name(self):
         self.assertIn("salvo-nxc", self.workflow)
+
+
+class TestBareInvocation(unittest.TestCase):
+    def test_running_salvo_with_no_arguments_shows_help(self):
+        """
+        A first-time user typing `salvo` got "[!] no targets given." and
+        nothing else. True, but it does not tell them what the tool is.
+        """
+        r = run_cli()
+        self.assertIn("usage: salvo", r.stdout)
+        self.assertIn("--dry-run", r.stdout)
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_a_real_invocation_missing_targets_still_says_so(self):
+        r = run_cli("-u", "jdoe", "-p", "Password123!")
+        self.assertIn("no targets given", r.stdout + r.stderr)

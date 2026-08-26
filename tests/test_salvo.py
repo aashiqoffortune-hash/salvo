@@ -9,6 +9,7 @@ Kali box straight after `git clone`:
 pytest collects unittest.TestCase classes too, if you happen to have it.
 """
 
+import io
 import json
 import os
 import stat
@@ -284,13 +285,13 @@ class TestPlan(unittest.TestCase):
         jobs = runner.plan([nt()], protos, ["10.0.0.1"])
         self.assertEqual(sorted(j[1] for j in jobs), ["smb", "winrm"])
         for proto in ("ssh", "ftp", "nfs", "vnc"):
-            self.assertIn((nt().key, proto), runner.not_run)
+            self.assertIn((nt().key, proto), runner.overlay)
 
     def test_local_auth_skips_ldap(self):
         runner = salvo.Runner(args_ns(), None)
         jobs = runner.plan([pw(local=True)], ["smb", "ldap"], ["10.0.0.1"])
         self.assertEqual([j[1] for j in jobs], ["smb"])
-        self.assertIn((pw(local=True).key, "ldap"), runner.not_run)
+        self.assertIn((pw(local=True).key, "ldap"), runner.overlay)
 
     def test_a_skipped_job_is_recorded_not_dropped(self):
         """
@@ -299,15 +300,17 @@ class TestPlan(unittest.TestCase):
         """
         runner = salvo.Runner(args_ns(), None)
         runner.plan([nt()], ["ssh"], ["10.0.0.1"])
-        self.assertTrue(runner.not_run)
-        self.assertIn("-H", list(runner.not_run.values())[0])
+        self.assertTrue(runner.overlay)
+        status, reason = list(runner.overlay.values())[0]
+        self.assertEqual(status, salvo.NOT_RUN)
+        self.assertIn("-H", reason)
 
     def test_nothing_is_skipped_for_an_ordinary_password(self):
         runner = salvo.Runner(args_ns(), None)
         protos = list(salvo.DEFAULT_PW_PROTOCOLS)
         jobs = runner.plan([pw(domain="corp.local")], protos, ["10.0.0.1"])
         self.assertEqual(len(jobs), len(protos))
-        self.assertEqual(runner.not_run, {})
+        self.assertEqual(runner.overlay, {})
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +328,7 @@ class TestMatrix(unittest.TestCase):
         protos = ["smb", "ssh"]
         runner.plan([cred], protos, ["192.168.100.25"])
         out = salvo.render_matrix([hit(cred, "smb", status=salvo.ADMIN)],
-                                  protos, not_run=runner.not_run)
+                                  protos, overlay=runner.overlay)
         ssh_row = [l for l in out.splitlines() if "192.168.100.25" in l][0]
         self.assertIn("n/a", ssh_row)
         self.assertIn("ADMIN", ssh_row)
@@ -334,7 +337,7 @@ class TestMatrix(unittest.TestCase):
     def test_a_job_that_ran_and_got_nothing_still_renders_dash(self):
         cred = pw()
         out = salvo.render_matrix([hit(cred, "smb", status=salvo.ADMIN)],
-                                  ["smb", "winrm"], not_run={})
+                                  ["smb", "winrm"], overlay={})
         row = [l for l in out.splitlines() if "192.168.100.25" in l][0]
         self.assertIn("-", row)
         self.assertNotIn("n/a", row)
@@ -344,7 +347,7 @@ class TestMatrix(unittest.TestCase):
         runner = salvo.Runner(args_ns(), None)
         protos = ["smb", "ssh", "ftp", "nfs"]
         runner.plan([cred], protos, ["10.0.0.1"])
-        out = salvo.render_matrix([hit(cred, "smb")], protos, not_run=runner.not_run)
+        out = salvo.render_matrix([hit(cred, "smb")], protos, overlay=runner.overlay)
         # one explanation for all three, not the same sentence three times
         # (the legend also mentions n/a, so match on the reason text itself)
         self.assertEqual(out.count("nxc defines no -H here"), 1, out)
@@ -380,7 +383,7 @@ class TestMatrix(unittest.TestCase):
         runner = salvo.Runner(args_ns(), None)
         runner.plan([cred], ["smb", "ssh"], ["10.0.0.1"])
         out = salvo.render_matrix([hit(cred, "smb")], ["smb", "ssh"],
-                                  markdown=True, not_run=runner.not_run)
+                                  markdown=True, overlay=runner.overlay)
         self.assertIn("n/a", out)
         self.assertIn("no -H", out)
 
@@ -402,6 +405,12 @@ class TestIpSortKey(unittest.TestCase):
 
 class TestCredFile(unittest.TestCase):
     def parse(self, text):
+        return self.parse_full(text)[0]
+
+    def problems(self, text):
+        return self.parse_full(text)[1]
+
+    def parse_full(self, text):
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
             fh.write(text)
             path = fh.name
@@ -662,8 +671,12 @@ class TestEndToEnd(unittest.TestCase):
         self.run_salvo("-P", "smb,winrm", "--json", self.json)
         with open(self.json) as fh:
             doc = json.load(fh)
-        self.assertEqual(sorted(doc),
-                         ["generated", "not_run", "protocols", "results", "targets"])
+        self.assertEqual(sorted(doc), [
+            "commands", "generated", "host_count", "not_run", "nxc_version",
+            "protocols", "results", "salvo_version", "targets"])
+        self.assertEqual(doc["salvo_version"], salvo.__version__)
+        self.assertIn("fake", doc["nxc_version"])
+        self.assertTrue(doc["commands"])
         self.assertTrue(doc["results"])
         self.assertTrue(any(r["status"] == salvo.ADMIN for r in doc["results"]))
 
@@ -731,3 +744,346 @@ class TestEndToEnd(unittest.TestCase):
         good = self.run_salvo("-P", "smb", "--state", self.state)
         self.assertIn("1 nxc process(es)", good.stdout)
         self.assertIn("ADMIN", good.stdout)
+
+
+# ---------------------------------------------------------------------------
+# Address handling and the lockout arithmetic
+# ---------------------------------------------------------------------------
+
+class TestHostCounting(unittest.TestCase):
+    def test_a_malformed_address_is_not_an_address(self):
+        """The old regex accepted this and gave it a row in the matrix."""
+        self.assertFalse(salvo.is_literal_ip("192.168.1.999"))
+        self.assertFalse(salvo.is_literal_ip("10.0.0.0/24"))
+        self.assertTrue(salvo.is_literal_ip("10.0.0.1"))
+        self.assertTrue(salvo.is_literal_ip("::1"))
+
+    def test_cidr_is_expanded_rather_than_shrugged_at(self):
+        self.assertEqual(salvo.count_hosts(["10.0.0.0/24"]), 256)
+        self.assertEqual(salvo.count_hosts(["10.0.0.0/30"]), 4)
+
+    def test_octet_range_is_counted(self):
+        self.assertEqual(salvo.count_hosts(["10.0.0.20-40"]), 21)
+
+    def test_a_hostname_counts_as_one_host(self):
+        self.assertEqual(salvo.count_hosts(["dc01.corp.local"]), 1)
+
+    def test_mixed_targets_add_up(self):
+        self.assertEqual(salvo.count_hosts(["10.0.0.1", "10.0.0.8/30", "srv"]), 6)
+
+    def test_a_target_file_is_read_and_counted(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write("# hosts\n10.0.0.1\n10.0.0.8/30\ndc01\n")
+            path = fh.name
+        try:
+            self.assertEqual(salvo.count_hosts([path]), 6)
+        finally:
+            os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# Process hygiene
+# ---------------------------------------------------------------------------
+
+class FakeProc(object):
+    def __init__(self, text=""):
+        self.stdout = io.StringIO(text)
+        self.returncode = 0
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
+
+
+class TestProcessHygiene(unittest.TestCase):
+    def spawn_with(self, runner, popen):
+        real = salvo.subprocess.Popen
+        salvo.subprocess.Popen = popen
+        try:
+            runner.run_one(pw(), "smb", ["10.0.0.1"], "sig")
+        finally:
+            salvo.subprocess.Popen = real
+
+    def test_nxc_never_inherits_the_operators_terminal(self):
+        """
+        Six concurrent nxc processes sharing salvo's stdin will eat the
+        keystrokes meant for salvo.
+        """
+        seen = {}
+        self.spawn_with(salvo.Runner(args_ns(), None),
+                        lambda cmd, **kw: (seen.update(kw), FakeProc())[1])
+        self.assertEqual(seen.get("stdin"), salvo.subprocess.DEVNULL)
+
+    def test_output_decoding_never_raises(self):
+        """A non-UTF-8 byte in a hostname must not take the job down."""
+        seen = {}
+        self.spawn_with(salvo.Runner(args_ns(), None),
+                        lambda cmd, **kw: (seen.update(kw), FakeProc())[1])
+        self.assertEqual(seen.get("errors"), "replace")
+
+    def test_the_spawn_is_guarded_against_the_lockout_sweep(self):
+        """
+        The abort check and the spawn have to be atomic. If they are not, a
+        job that passed the check just before a lockout was detected spawns
+        after kill_all has swept, and spends a logon on a locked account.
+        """
+        runner = salvo.Runner(args_ns(), None)
+        held = []
+
+        def popen(cmd, **kw):
+            # same thread: a plain Lock cannot be re-acquired if it is held
+            held.append(not runner.proc_lock.acquire(blocking=False))
+            return FakeProc()
+
+        self.spawn_with(runner, popen)
+        self.assertEqual(held, [True], "the process lock was not held across the spawn")
+
+    def test_finished_processes_are_not_retained(self):
+        runner = salvo.Runner(args_ns(), None)
+        self.spawn_with(runner, lambda cmd, **kw: FakeProc())
+        self.assertEqual(runner.procs, [], "a long run would carry every process it started")
+
+    def test_a_process_that_cannot_start_becomes_a_visible_cell(self):
+        runner = salvo.Runner(args_ns(), None)
+
+        def boom(cmd, **kw):
+            raise OSError(13, "Permission denied")
+
+        self.spawn_with(runner, boom)
+        self.assertIn((pw().key, "smb"), runner.overlay)
+        self.assertTrue(runner.job_errors)
+
+    def test_the_command_actually_sent_is_recorded_for_audit(self):
+        runner = salvo.Runner(args_ns(), None)
+        self.spawn_with(runner, lambda cmd, **kw: FakeProc())
+        self.assertEqual(len(runner.commands), 1)
+        self.assertIn("smb", runner.commands[0])
+
+
+# ---------------------------------------------------------------------------
+# Credential file problems are reported, never swallowed
+# ---------------------------------------------------------------------------
+
+class TestCredFileProblems(unittest.TestCase):
+    def problems(self, text):
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write(text)
+            path = fh.name
+        try:
+            return salvo.parse_cred_file(path)[1]
+        finally:
+            os.unlink(path)
+
+    def test_a_line_with_no_separator_is_named_by_number(self):
+        problems = self.problems("jdoe:Pw\ngarbage\n")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("line 2", problems[0])
+
+    def test_an_empty_secret_is_refused_not_sprayed(self):
+        problems = self.problems("jdoe:\n")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("empty secret", problems[0])
+
+    def test_an_empty_username_is_refused(self):
+        self.assertIn("empty username", self.problems(":Password1\n")[0])
+
+    def test_a_clean_file_reports_nothing(self):
+        self.assertEqual(self.problems("# note\n\njdoe:Pw\nCORP\\svc:Pw2\n"), [])
+
+
+# ---------------------------------------------------------------------------
+# Overlay rendering for jobs that failed rather than were skipped
+# ---------------------------------------------------------------------------
+
+class TestOverlayRendering(unittest.TestCase):
+    def test_a_rejected_job_renders_cmd_not_dash(self):
+        cred = pw()
+        overlay = {(cred.key, "winrm"): (salvo.USAGE, "nxc exited 2")}
+        out = salvo.render_matrix([hit(cred, "smb", status=salvo.ADMIN)],
+                                  ["smb", "winrm"], overlay=overlay)
+        row = [l for l in out.splitlines() if "192.168.100.25" in l][0]
+        self.assertIn("!CMD", row)
+
+    def test_an_errored_job_renders_err(self):
+        cred = pw()
+        overlay = {(cred.key, "winrm"): (salvo.ERROR, "could not start nxc")}
+        out = salvo.render_matrix([hit(cred, "smb", status=salvo.ADMIN)],
+                                  ["smb", "winrm"], overlay=overlay)
+        self.assertIn("err", [c.strip() for c in
+                              [l for l in out.splitlines() if "192.168.100.25" in l][0].split()])
+
+    def test_reasons_are_still_reported_when_nothing_answered(self):
+        """No hits at all used to print 'no results' and drop every reason."""
+        cred = nt()
+        runner = salvo.Runner(args_ns(), None)
+        runner.plan([cred], ["ssh"], ["10.0.0.1"])
+        out = salvo.render_matrix([], ["ssh"], overlay=runner.overlay)
+        self.assertIn("no -H", out)
+        self.assertNotEqual(out.strip(), "no results.")
+
+
+# ---------------------------------------------------------------------------
+# Operator-facing CLI behaviour
+# ---------------------------------------------------------------------------
+
+class TestOperatorCli(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil as _sh
+        _sh.rmtree(self.dir, ignore_errors=True)
+
+    def test_version_is_reportable(self):
+        r = run_cli("--version")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn(salvo.__version__, r.stdout + r.stderr)
+
+    def test_an_explicit_setting_beats_a_preset(self):
+        """--slow is a set of defaults, not an override of what was asked for."""
+        r = run_cli("10.0.0.1", "-u", "j", "-p", "p", "-P", "smb",
+                    "--slow", "--nxc-timeout", "60", "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("--smb-timeout 60", r.stdout)
+
+    def test_a_preset_still_applies_where_nothing_was_asked_for(self):
+        r = run_cli("10.0.0.1", "-u", "j", "-p", "p", "-P", "smb",
+                    "--slow", "--dry-run")
+        self.assertIn("--smb-timeout 30", r.stdout)
+
+    def test_an_unwritable_report_path_fails_before_any_logon(self):
+        r = run_cli("10.0.0.10", "-u", "j", "-p", "p", "-P", "smb",
+                    "--nxc-bin", FAKE_NXC, "--quiet",
+                    "--json", os.path.join(self.dir, "no", "such", "out.json"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("does not exist", r.stdout + r.stderr)
+        # and nothing was sprayed on the way to finding out
+        self.assertNotIn("nxc process(es)", r.stdout)
+
+    def test_an_unwritable_state_path_fails_before_any_logon(self):
+        r = run_cli("10.0.0.10", "-u", "j", "-p", "p", "-P", "smb",
+                    "--nxc-bin", FAKE_NXC, "--quiet",
+                    "--state", os.path.join(self.dir, "nope", "s.state"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("nxc process(es)", r.stdout)
+
+    def test_unreadable_credential_lines_are_reported(self):
+        path = os.path.join(self.dir, "creds.txt")
+        with open(path, "w") as fh:
+            fh.write("jdoe:Password123!\nthis-line-is-broken\n")
+        r = run_cli("10.0.0.1", "-C", path, "-P", "smb", "--dry-run")
+        self.assertIn("line 2", r.stdout)
+        self.assertIn("NOT being tested", r.stdout)
+
+    def test_lockout_math_counts_a_cidr_and_names_every_account(self):
+        path = os.path.join(self.dir, "creds.txt")
+        with open(path, "w") as fh:
+            fh.write("jdoe:Password123!\nsvc_sql:Winter2026!\n")
+        r = run_cli("10.0.0.0/29", "-C", path, "-P", "smb,winrm",
+                    "--nxc-bin", FAKE_NXC, "--quiet")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("2 protocol-jobs x 8 hosts", r.stdout)
+        self.assertIn("jdoe", r.stdout)
+        self.assertIn("svc_sql", r.stdout)
+
+    def test_parallel_must_be_sane(self):
+        r = run_cli("10.0.0.1", "-u", "j", "-p", "p", "--parallel", "0", "--dry-run")
+        self.assertNotEqual(r.returncode, 0)
+
+
+class TestEndToEndFailureModes(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.state = os.path.join(self.dir, "s.state")
+
+    def tearDown(self):
+        import shutil as _sh
+        _sh.rmtree(self.dir, ignore_errors=True)
+
+    def salvo(self, *extra, **kw):
+        base = ["10.0.0.10", "10.0.0.11", "-u", "jdoe", "-p", "Password123!",
+                "-d", "corp.local", "--nxc-bin", FAKE_NXC, "--quiet"]
+        return run_cli(*(base + list(extra)), **kw)
+
+    def test_a_lockout_stops_the_run_and_is_not_recorded_as_done(self):
+        r = self.salvo("-P", "smb,winrm,ldap", "--state", self.state,
+                       env={"FAKE_NXC_LOCKOUT": "1"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("LOCKOUT DETECTED", r.stderr)
+        # an aborted run must leave nothing marked complete, or the retry
+        # would skip exactly the jobs that never finished
+        recorded = {}
+        if os.path.exists(self.state):
+            with open(self.state) as fh:
+                recorded = json.load(fh)["jobs"]
+        self.assertEqual(recorded, {})
+
+    def test_undecodable_output_does_not_kill_the_job(self):
+        r = self.salvo("-P", "smb", env={"FAKE_NXC_BINARY": "1"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("ADMIN", r.stdout)
+        self.assertNotIn("Traceback", r.stdout + r.stderr)
+
+    def test_the_report_names_the_nxc_that_produced_it(self):
+        r = self.salvo("-P", "smb")
+        self.assertIn("salvo " + salvo.__version__, r.stdout)
+        self.assertIn("nxc 1.5.0-fake", r.stdout)
+
+
+# ---------------------------------------------------------------------------
+# Degenerate inputs
+# ---------------------------------------------------------------------------
+
+class TestDegradedInputs(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "s.state")
+
+    def tearDown(self):
+        import shutil as _sh
+        _sh.rmtree(self.dir, ignore_errors=True)
+
+    def test_a_salvo_side_failure_never_renders_as_a_closed_port(self):
+        """
+        classify_error reads "timed out" out of a message and returns
+        NO_SERVICE, which renders '-'. For salvo's own failure that would
+        state something about the target that salvo never learned.
+        """
+        runner = salvo.Runner(args_ns(), None)
+        runner.record_job_error(pw(), "smb", "could not start nxc: timed out")
+        status, _reason = runner.overlay[(pw().key, "smb")]
+        self.assertEqual(status, salvo.ERROR)
+        self.assertNotEqual(status, salvo.NO_SERVICE)
+
+    def test_a_state_file_with_no_job_table_starts_fresh(self):
+        with open(self.path, "w") as fh:
+            json.dump({"version": salvo.STATE_VERSION, "jobs": "not a dict"}, fh)
+        self.assertEqual(salvo.State(self.path).load(), 0)
+
+    def test_an_unrebuildable_result_forces_a_re_run(self):
+        """An extra logon beats a fabricated verdict."""
+        cred = pw()
+        sig = salvo.job_signature(cred, "smb", ["10.0.0.1"])
+        with open(self.path, "w") as fh:
+            json.dump({"version": salvo.STATE_VERSION,
+                       "jobs": {sig: {"hits": [{"protocol": "smb"}]}}}, fh)
+        st = salvo.State(self.path)
+        st.load()
+        self.assertEqual(st.prior_hits(sig, cred), [])
+
+    def test_the_live_line_survives_an_unexpected_status(self):
+        cred = pw()
+        line = salvo.fmt_live(salvo.Hit(cred, "smb", "10.0.0.1", 445, "DC01",
+                                        salvo.NOT_RUN, "n", ""))
+        self.assertIn("smb", line)
+
+    def test_piping_into_head_does_not_traceback(self):
+        """An operator pipes into head or less constantly."""
+        import shlex as _sh
+        cmd = "{} {} 10.0.0.10 -u j -p p -P smb,winrm --nxc-bin {} --quiet | head -2".format(
+            _sh.quote(sys.executable), _sh.quote(SALVO_PY), _sh.quote(FAKE_NXC))
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+        self.assertNotIn("BrokenPipeError", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)

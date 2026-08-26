@@ -21,6 +21,7 @@ host                       smb   winrm     wmi   mssql    ldap     rdp     ssh  
   ?      = cannot tell, retest elsewhere    . = refused    - = no service / no answer
   !CMD   = nxc REJECTED the command salvo built - this cell was never tested
   n/a    = salvo ran NO job here - a fact about salvo, not about the host
+  err    = salvo could not run this job - also not a verdict
 ```
 
 Stdlib only. No pip, no virtualenv, no dependencies beyond `nxc` itself.
@@ -87,10 +88,11 @@ host                       smb   winrm     ssh     ftp
   n/a  ssh, ftp             nxc defines no -H here, so a hash cannot be tested over this protocol
 ```
 
-`-` is a statement about the host. `n/a` is a statement about salvo. They are
-different facts and the matrix keeps them apart. `--json` carries the same
-distinction in a `not_run` array, so a consumer of the file is not left to infer
-it from an absence.
+`-` is a statement about the host. Every other empty-cell glyph is a statement
+about salvo — `n/a` skipped, `!CMD` a command nxc rejected, `err` a job salvo
+could not run at all — and each prints its reason under the table. `--json`
+carries the same distinction in a `not_run` array, so a consumer of the file is
+not left to infer it from an absence.
 
 ---
 
@@ -160,13 +162,66 @@ Each job is keyed on a hash of the credential, the protocol **and** the target l
 
 ---
 
-## Lockout safety
+## Running it against production
 
-Every protocol against every host is a separate authentication attempt, and a domain account's counter lives on the DC regardless of which member server you hit. `salvo` does the arithmetic before it starts:
+The things an engagement actually depends on, and what salvo does about each.
+
+**It stops when told to.** `Ctrl-C` kills every running `nxc` immediately and
+still prints the matrix and saves state. A thread pool's shutdown waits for
+every queued job by default, which would have meant minutes of further spraying
+after the operator asked it to stop; salvo aborts first and shuts down after.
+
+**A lockout ends the run, not the sweep.** The abort check and the process spawn
+are taken under one lock, so a job cannot pass the check microseconds before a
+lockout is detected and then spawn behind the kill sweep. That race is one
+logon against an account that is already locked, which is the one thing this
+tool must never spend.
+
+**It fails before it sprays, not after.** `--json`, `--state` and `--logdir` are
+checked for writability up front. Discovering at the end of a two-hour run that
+the report directory does not exist loses the run, and the logons are not
+refundable.
+
+**It does not lose a job to an odd byte.** `nxc` output is decoded with
+replacement, `stdin` is `/dev/null` so six concurrent processes cannot eat the
+keystrokes meant for salvo, every child is reaped, and a job that dies for any
+reason gets a cell that says so rather than an empty one that reads `-`.
+
+**A preset is a default, not an override.** `--slow` and `--stealth` fill in
+only what you did not set. `--nxc-timeout 60 --slow` stays 60, and salvo says
+so.
+
+**Nothing is dropped in silence.** An unreadable line in a `-C` file is reported
+by line number, because a credential you believe is being tested and is not is
+worse than one you know failed.
+
+## Provenance
+
+`salvo --version`, and every run opens by naming itself and the NetExec it
+found:
 
 ```
-[!] LOCKOUT MATH: 'jdoe' will take up to 24 logons (8 protocol-jobs x 3 hosts).
-    A domain account's counter is on the DC, so every host counts.
+[*] salvo 1.0.0  |  nxc 1.5.0
+```
+
+The `--json` report carries `salvo_version`, `nxc_version`, a timezone-aware
+`generated`, the resolved `host_count`, and a `commands` array holding every
+`nxc` command line actually executed. salvo parses nxc's human-readable output,
+so a result is only interpretable against a known nxc — and when a client asks
+exactly what was sent at their estate, the answer is in the file rather than in
+someone's shell history.
+
+## Lockout safety
+
+Every protocol against every host is a separate authentication attempt, and a domain account's counter lives on the DC regardless of which member server you hit. `salvo` does the arithmetic before it starts, for **every** account at risk, and
+expands CIDRs, octet ranges and target files rather than leaving you the
+multiplication:
+
+```
+[!] LOCKOUT MATH - each protocol against each host is a separate logon,
+    and a domain account's counter lives on the DC, so every host counts.
+      jdoe                     up to 32 logons (4 protocol-jobs x 8 hosts)
+      svc_sql                  up to 32 logons (4 protocol-jobs x 8 hosts)
     Default AD lockout threshold is often 5. Check it first:
         nxc smb <DC_IP> -u '' -p '' --pass-pol
 ```
@@ -207,7 +262,7 @@ If you are operating under rules that restrict tooling, confirm those rules your
 | `-P`, `--protocols` | `smb,winrm,wmi,mssql,ldap,rdp,ssh,ftp` | comma list, or `all` |
 | `--parallel` | 6 | concurrent `nxc` processes |
 | `--nxc-threads` | 25 | `nxc`'s own `-t` per process |
-| `--nxc-timeout` | 15 | `nxc --timeout` seconds |
+| `--nxc-timeout` | 15 | seconds for nxc's per-protocol timeout flag |
 | `--jitter` | — | `nxc --jitter` value |
 | `--slow` | off | tunnel preset: 3 / 5 / 30 |
 | `--markdown` | off | matrix as a Markdown table |
@@ -220,6 +275,7 @@ If you are operating under rules that restrict tooling, confirm those rules your
 | `--forget` | off | delete the state file and exit |
 | `--no-lockout-guard` | off | do not abort on lockout |
 | `--nxc-bin` | `nxc` | path to `nxc` |
+| `--version` | — | print the salvo version and exit |
 
 ---
 
@@ -239,9 +295,10 @@ fresh clone:
 python3 -m unittest discover -s tests -v
 ```
 
-72 tests covering the verdict table, the `nxc` command builder, planning and
-resume, matrix rendering and its determinism, credential parsing, and file
-permissions. Three are worth naming:
+107 tests covering the verdict table, the `nxc` command builder, planning and
+resume, matrix rendering and its determinism, credential parsing, host
+counting, process hygiene, degraded state files, and file permissions. Three
+are worth naming:
 
 - **the scope invariant** — every credential shape against every protocol, then
   assert that no execution or dumping flag (`-x`, `-X`, `-M`, `--sam`, `--lsa`,

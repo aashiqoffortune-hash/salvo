@@ -12,8 +12,14 @@ Behaviour by protocol, chosen to exercise every verdict bucket:
     ldap   10.0.0.10 -> plain [+] (ok)
     others            -> nothing at all, like a closed port
 
-Set FAKE_NXC_FAIL=1 to exit non-zero with a usage error, the way nxc does when
-salvo builds a command a protocol does not accept.
+Environment switches, each reproducing a failure mode that is awkward to
+arrange on a live range:
+
+    FAKE_NXC_FAIL=1      exit non-zero with a usage error, the way nxc does
+                         when salvo builds a command a protocol rejects
+    FAKE_NXC_LOCKOUT=1   answer STATUS_ACCOUNT_LOCKED_OUT on the first host
+    FAKE_NXC_BINARY=1    emit an invalid UTF-8 byte in a hostname
+    FAKE_NXC_HANG=1      sleep, so kill paths can be exercised
 """
 
 import os
@@ -48,6 +54,15 @@ def parse():
 
 
 def main():
+    if "--version" in sys.argv[1:]:
+        print("nxc 1.5.0-fake")
+        return 0
+
+    if os.environ.get("FAKE_NXC_HANG"):
+        import time
+        time.sleep(300)
+        return 0
+
     if os.environ.get("FAKE_NXC_FAIL"):
         sys.stderr.write("usage: nxc [-h] ...\nnxc: error: unrecognized arguments: -d\n")
         return 2
@@ -58,7 +73,23 @@ def main():
     port = PORTS.get(proto, 445)
     tag = proto.upper()
 
+    if os.environ.get("FAKE_NXC_BINARY"):
+        # a hostname that is not valid UTF-8. Reading this must not take the
+        # job down with a decode error.
+        sys.stdout.flush()
+        sys.stdout.buffer.write(
+            "{:<11} {:<15} {:<6} ".format(tag, "10.0.0.10", port).encode()
+            + b"WEB\xff01           "
+            + "[+] corp.local\\{}:Password123! (Pwn3d!)\n".format(user).encode())
+        sys.stdout.buffer.flush()
+        return 0
+
     for ip, name, _n in HOSTS:
+        if os.environ.get("FAKE_NXC_LOCKOUT") and ip == "10.0.0.10":
+            print("{:<11} {:<15} {:<6} {:<16} [-] corp.local\\{}:Password123! "
+                  "STATUS_ACCOUNT_LOCKED_OUT".format(tag, ip, port, name, user))
+            continue
+
         print("{:<11} {:<15} {:<6} {:<16} [*] Windows 10.0 Build 19044 x64 "
               "(name:{}) (domain:corp.local) (signing:False) (SMBv1:False)"
               .format(tag, ip, port, name, name))

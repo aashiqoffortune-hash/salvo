@@ -24,6 +24,7 @@ Stdlib only - no pip, no virtualenv, no dependencies beyond nxc itself.
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -36,6 +37,8 @@ import time
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+
+__version__ = "1.0.0"
 
 STATE_VERSION = 1
 
@@ -66,6 +69,29 @@ def ip_sort_key(addr):
 # is the only defensible mode for any of them.
 PRIVATE_FILE_MODE = 0o600
 PRIVATE_DIR_MODE = 0o700
+
+
+def now_iso():
+    """
+    Timezone-aware local time. A naive timestamp in a report that will be read
+    by someone in another office is an ambiguity nobody can resolve later.
+    """
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def ensure_writable(path, what):
+    """
+    Fail before the first logon rather than after the last one. Finding out
+    that the report directory does not exist at the end of a two-hour run
+    loses the run, and the logons are not refundable.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(directory):
+        sys.exit("[!] {} directory does not exist: {}".format(what, directory))
+    if not os.access(directory, os.W_OK):
+        sys.exit("[!] {} directory is not writable: {}".format(what, directory))
+    if os.path.exists(path) and not os.access(path, os.W_OK):
+        sys.exit("[!] {} is not writable: {}".format(what, path))
 
 
 def open_private(path):
@@ -261,7 +287,65 @@ STATUS_MAP = [
 # identical to a wrong password.
 AMBIGUOUS_BARE_FAILURE = {"winrm", "rdp", "wmi", "ldap", "mssql"}
 
-LITERAL_IP = re.compile(r"^[0-9]{1,3}(?:\.[0-9]{1,3}){3}$")
+# nxc's "first-last-octet" range form, e.g. 10.0.0.20-40
+OCTET_RANGE_RE = re.compile(r"^(?P<head>\d{1,3}(?:\.\d{1,3}){2})\.(?P<first>\d{1,3})-(?P<last>\d{1,3})$")
+
+
+def is_literal_ip(text):
+    """
+    True only for an address that really parses. The old regex accepted
+    '192.168.1.999', which then got a matrix row of its own.
+    """
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
+
+
+def count_hosts(targets):
+    """
+    How many addresses this target spec actually covers.
+
+    The lockout warning is only worth printing if the number in it is real.
+    Saying "N per host, and the host count is unknown" for a /24 leaves the
+    operator to do the multiplication that the whole warning exists to do.
+
+    CIDR is counted at full size, network and broadcast included: for a
+    warning about spending an account's lockout budget, over-counting is the
+    safe direction. A hostname counts as one host. Returns None only when a
+    target file cannot be read.
+    """
+    total = 0
+    for t in targets:
+        n = _count_one(t)
+        if n is None:
+            return None
+        total += n
+    return total
+
+
+def _count_one(target, follow_files=True):
+    if is_literal_ip(target):
+        return 1
+    try:
+        return ipaddress.ip_network(target, strict=False).num_addresses
+    except ValueError:
+        pass
+    m = OCTET_RANGE_RE.match(target)
+    if m:
+        first, last = int(m.group("first")), int(m.group("last"))
+        if 0 <= first <= last <= 255:
+            return last - first + 1
+    if follow_files and os.path.isfile(target):
+        try:
+            with open(target, errors="replace") as fh:
+                entries = [l.strip() for l in fh
+                           if l.strip() and not l.strip().startswith("#")]
+        except OSError:
+            return None
+        return sum(_count_one(e, follow_files=False) or 1 for e in entries)
+    return 1   # a hostname is one host
 
 # any per-protocol timeout flag in an nxc --help, including ones salvo's
 # TIMEOUT_FLAG table has never heard of
@@ -362,14 +446,20 @@ def parse_cred_file(path):
         user:aad3b435b51404eeaad3b435b51404ee:31d6cfe0...
         DOMAIN\\user:password
     Blank lines and lines starting with # are ignored.
+
+    Returns (entries, problems). A line salvo cannot read is a credential the
+    operator believes is being tested and is not, so every one is reported by
+    line number instead of dropped in silence.
     """
-    out = []
+    out, problems = [], []
     with open(path, "r", errors="replace") as fh:
-        for raw in fh:
+        for lineno, raw in enumerate(fh, 1):
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
             if ":" not in line:
+                problems.append("line {}: no ':' separator, skipped - {!r}"
+                                .format(lineno, line[:40]))
                 continue
             user, secret = line.split(":", 1)
             dom = None
@@ -377,8 +467,17 @@ def parse_cred_file(path):
                 dom, user = user.split("\\", 1)
             user = user.strip().lstrip("\\")
             dom = dom.strip().rstrip("\\") if dom else None
-            out.append((dom, user, secret.strip(), looks_like_hash(secret)))
-    return out
+            secret = secret.strip()
+            if not user:
+                problems.append("line {}: empty username, skipped".format(lineno))
+                continue
+            if not secret:
+                problems.append("line {}: empty secret for {!r}, skipped - an "
+                                "empty password still spends a logon"
+                                .format(lineno, user))
+                continue
+            out.append((dom, user, secret, looks_like_hash(secret)))
+    return out, problems
 
 
 class State:
@@ -417,7 +516,11 @@ class State:
             sys.stderr.write("[!] state file is version {}, expected {} - starting fresh\n"
                              .format(data.get("version"), STATE_VERSION))
             return 0
-        self.jobs = data.get("jobs", {})
+        jobs = data.get("jobs")
+        if not isinstance(jobs, dict):
+            sys.stderr.write("[!] state file has no usable job table, starting fresh\n")
+            return 0
+        self.jobs = jobs
         return len(self.jobs)
 
     def is_done(self, sig):
@@ -426,9 +529,18 @@ class State:
     def prior_hits(self, sig, cred):
         """Rebuild Hit objects from a completed job so they merge into the matrix."""
         out = []
-        for r in self.jobs.get(sig, {}).get("hits", []):
-            out.append(Hit(cred, r["protocol"], r["ip"], r["port"],
-                           r["hostname"], r["status"], r["note"], r["raw"]))
+        record = self.jobs.get(sig) or {}
+        for r in record.get("hits") or []:
+            try:
+                out.append(Hit(cred, r["protocol"], r["ip"], int(r["port"]),
+                               r["hostname"], r["status"], r["note"], r["raw"]))
+            except (KeyError, TypeError, ValueError):
+                # A record salvo cannot rebuild is one it must not claim to
+                # have. Dropping it means the job is re-run, which is the safe
+                # direction: an extra logon beats a fabricated verdict.
+                sys.stderr.write("[!] unreadable result in state file, that job "
+                                 "will be re-run\n")
+                return []
         return out
 
     def complete(self, sig, cred, proto, targets, hits):
@@ -437,7 +549,7 @@ class State:
                 "cred": cred.to_dict(),
                 "protocol": proto,
                 "targets": sorted(targets),
-                "completed": datetime.now().isoformat(timespec="seconds"),
+                "completed": now_iso(),
                 "hits": [h.as_dict() for h in hits],
             }
             self.dirty = True
@@ -550,7 +662,16 @@ class Runner:
         self.job_failures = []        # (proto, user, returncode, tail) - nxc refused to run
         self.unparsed = {}            # proto -> count of output lines LINE_RE did not match
         self.parsed = {}              # proto -> count of output lines it did match
-        self.not_run = {}             # (cred.key, proto) -> why no job was ever run
+        # (cred.key, proto) -> (status, reason) for a job that produced no
+        # result of its own: skipped, rejected by nxc, or errored. Without it
+        # the cell stays empty and renders '-'.
+        self.overlay = {}
+        self.job_errors = []          # (proto, user, message) - salvo could not run it
+        self.commands = []            # every nxc command line actually executed
+        # Guards self.procs only. Spawning holds it, so a spawn cannot
+        # interleave with the kill sweep; keeping it off self.lock means the
+        # per-output-line bookkeeping does not contend with process startup.
+        self.proc_lock = threading.Lock()
 
     def build_cmd(self, cred, proto, targets):
         """
@@ -621,22 +742,49 @@ class Runner:
         logpath = self.logpath_for(cred, proto)
         job_hits = []
 
+        # truncating open, not append - a re-run of the same job replaces its
+        # log rather than growing it. Owner-only: every nxc line echoes the
+        # password back. Opened before the spawn so a bad --logdir costs
+        # nothing rather than orphaning a running process.
+        logfh = None
+        if logpath:
+            try:
+                logfh = open_private(logpath)
+            except OSError as exc:
+                self.record_job_error(cred, proto,
+                                      "cannot write {}: {}".format(logpath, exc))
+                return
+
+        # The abort check and the spawn must be atomic. Checked outside the
+        # lock, a job that passed the check microseconds before a lockout was
+        # detected would spawn AFTER kill_all had already swept - and spend a
+        # logon against an account that is already locked out. That is the one
+        # thing this tool must never do.
         try:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
-            )
-        except FileNotFoundError:
-            self.record(Hit(cred, proto, "-", 0, "-", ERROR, "nxc not found", ""))
+            with self.proc_lock:
+                if self.abort.is_set():
+                    logfh and logfh.close()
+                    return
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    # nxc must never reach the operator's terminal: six of them
+                    # sharing a stdin will eat the keystrokes meant for salvo.
+                    stdin=subprocess.DEVNULL,
+                    # a stray non-UTF-8 byte in a hostname must not take the
+                    # whole job down with a decode error
+                    text=True, errors="replace", bufsize=1,
+                )
+                self.procs.append(proc)
+            with self.lock:
+                # the audit answer to "what exactly did you send at our estate"
+                self.commands.append(" ".join(quote(c) for c in cmd))
+        except OSError as exc:
+            logfh and logfh.close()
+            self.record_job_error(cred, proto, "could not start {}: {}".format(
+                self.args.nxc_bin, exc))
             return
 
-        with self.lock:
-            self.procs.append(proc)
-
-        # truncating open, not append - a re-run of the same job replaces its
-        # log rather than growing it
-        # owner-only: every nxc line echoes the password back
-        logfh = open_private(logpath) if logpath else None
         clean = False
         tail = deque(maxlen=6)   # last few lines, for when nxc refuses to run
         try:
@@ -693,13 +841,15 @@ class Runner:
                 if status == LOCKED and not self.args.no_lockout_guard:
                     self.trigger_abort(hit)
             clean = True
+        except (OSError, ValueError) as exc:
+            # the pipe went away - killed process, closed descriptor
+            if not self.abort.is_set():
+                self.record_job_error(cred, proto,
+                                      "reading nxc output failed: {}".format(exc))
         finally:
             if logfh:
                 logfh.close()
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                proc.kill()
+            self.reap(proc)
 
         # ---- a job that produced no verdict at all ---------------------------
         # Three different facts used to collapse into the same '-' cell:
@@ -710,14 +860,11 @@ class Runner:
                 and proc.returncode not in (0, None)):
             msg = " | ".join(t for t in tail) or "no output"
             with self.lock:
-                self.job_failures.append((proto, cred.user, proc.returncode, msg))
-            note = "nxc exited {} without producing a single result line".format(proc.returncode)
-            for t in targets:
-                if LITERAL_IP.match(t):
-                    self.record(Hit(cred, proto, t, DEFAULT_PORT.get(proto, 0),
-                                    t, USAGE, note, msg[:200]))
-            if not any(LITERAL_IP.match(t) for t in targets):
-                self.record(Hit(cred, proto, "-", 0, "-", USAGE, note, msg[:200]))
+                self.job_failures.append((proto, cred, proc.returncode, msg))
+            self.mark_cell(cred, proto, USAGE,
+                           "nxc exited {} without producing a single result "
+                           "line - this protocol was never tested"
+                           .format(proc.returncode))
             return   # do NOT mark done - a rejected command must be retried
 
         # Only a clean, unaborted, zero-exit job is recorded as done. Anything
@@ -749,12 +896,59 @@ class Runner:
         self.kill_all()
 
     def kill_all(self):
-        with self.lock:
-            for p in self.procs:
+        with self.proc_lock:
+            for p in list(self.procs):
                 try:
                     p.kill()
                 except Exception:
                     pass
+
+    def reap(self, proc):
+        """
+        Close the pipe, make sure the child is really gone, and stop tracking
+        it. Killing without waiting leaves a zombie, and never dropping the
+        reference means a long run carries every process it ever started.
+        """
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+        with self.proc_lock:
+            try:
+                self.procs.remove(proc)
+            except ValueError:
+                pass
+
+    def mark_cell(self, cred, proto, status, reason):
+        """
+        Annotate a (credential, protocol) that produced no result of its own.
+
+        An absent result leaves an empty cell, and an empty cell renders '-',
+        which the legend defines as "no service / no answer" - a claim about
+        the target. Skipped, rejected and errored jobs are claims about salvo,
+        and the matrix has to keep them apart from a closed port.
+        """
+        with self.lock:
+            self.overlay[(cred.key, proto)] = (status, reason)
+
+    def record_job_error(self, cred, proto, message):
+        """A job salvo could not run at all - not a verdict about the target."""
+        with self.lock:
+            self.job_errors.append((proto, cred.user, message))
+        _status, note = classify_error(message)
+        # Always ERROR, never NO_SERVICE. classify_error reads "timed out" out
+        # of a message and would hand back NO_SERVICE, which renders '-' - a
+        # statement about the target for something that is salvo failing.
+        self.mark_cell(cred, proto, ERROR, note)
 
     def finalize(self):
         """
@@ -791,6 +985,9 @@ class Runner:
             "-d": (" -d " in help_text or "--domain" in help_text),
             "--local-auth": ("--local-auth" in help_text),
             "-H": (" -H " in help_text or "--hash" in help_text),
+            # sent unconditionally to every protocol, so it is the one flag
+            # that would break every column at once if a protocol lacked it
+            "--continue-on-success": ("--continue-on-success" in help_text),
             "timeout": TIMEOUT_FLAG.get(proto, "") in help_text if proto in TIMEOUT_FLAG else None,
         }
 
@@ -800,21 +997,33 @@ class Runner:
         salvo sent that the protocol does not define, and say so by name.
         """
         out = []
-        for proto in sorted({p for p, _u, _rc, _m in self.job_failures}):
+        by_proto = {}
+        for proto, cred, _rc, _m in self.job_failures:
+            by_proto.setdefault(proto, []).append(cred)
+
+        for proto in sorted(by_proto):
             supported = self.probe_flags(proto)
             if supported is None:
                 out.append("  {}: could not run 'nxc {} --help' to diagnose".format(proto, proto))
                 continue
-            sent = []
-            if self.args.domain and not self.args.local_auth and proto in DOMAIN_CAPABLE:
-                sent.append("-d")
-            if self.args.local_auth and proto in LOCAL_AUTH_CAPABLE:
-                sent.append("--local-auth")
-            bad = [f for f in sent if supported.get(f) is False]
+            # What salvo sent for THIS job's credential, not for the run as a
+            # whole. Under --both-auth the same protocol runs with and without
+            # --local-auth, and reading the run-level flags blamed the wrong one.
+            sent = {"--continue-on-success"}
+            for cred in by_proto[proto]:
+                if cred.local:
+                    if proto in LOCAL_AUTH_CAPABLE:
+                        sent.add("--local-auth")
+                elif cred.domain and proto in DOMAIN_CAPABLE:
+                    sent.add("-d")
+                if cred.is_hash:
+                    sent.add("-H")
+            bad = sorted(f for f in sent if supported.get(f) is False)
             if bad:
                 out.append("  {}: salvo sent {} but 'nxc {}' does not define it. "
-                           "Remove '{}' from the capability table at the top of this file."
-                           .format(proto, " and ".join(bad), proto, proto))
+                           "Correct the capability tables at the top of this file, "
+                           "then re-run 'salvo --check-nxc -P all'."
+                           .format(proto, " and ".join(bad), proto))
             else:
                 out.append("  {}: flags look valid - the failure is nxc itself, "
                            "not the command. Check the log.".format(proto))
@@ -902,15 +1111,13 @@ class Runner:
         return jobs
 
     def mark_not_run(self, cred, proto, reason):
-        """
-        Record a job salvo declined to run.
+        """A job salvo declined to run - no packet was ever sent."""
+        self.mark_cell(cred, proto, NOT_RUN, reason)
 
-        Dropping it silently is not free. An absent result leaves an empty
-        cell, an empty cell renders as '-', and the legend defines '-' as "no
-        service / no answer" - a claim about the target. Nothing was sent
-        here, so the matrix has to say that instead of implying a closed port.
-        """
-        self.not_run[(cred.key, proto)] = reason
+    @property
+    def not_run(self):
+        """The skipped subset of the overlay, for the JSON report."""
+        return {k: why for k, (st, why) in self.overlay.items() if st == NOT_RUN}
 
     def execute(self, jobs):
         if not jobs:
@@ -921,21 +1128,35 @@ class Runner:
             "  ({} skipped, already answered)".format(self.skipped) if self.skipped else ""))
 
         started = time.time()
+        # Not a `with` block. ThreadPoolExecutor.__exit__ shuts down with
+        # wait=True, so a Ctrl-C raised inside it would sit through every
+        # remaining queued job before the handler below ever ran - minutes of
+        # spraying after the operator asked it to stop. Aborting first makes
+        # the queued jobs return immediately, and only then do we shut down.
+        pool = ThreadPoolExecutor(max_workers=self.args.parallel)
+        futures = {}
         try:
-            with ThreadPoolExecutor(max_workers=self.args.parallel) as pool:
-                futs = [pool.submit(self.run_one, *j) for j in jobs]
-                for f in as_completed(futs):
-                    try:
-                        f.result()
-                    except Exception as exc:
-                        sys.stderr.write("[!] job error: {}\n".format(exc))
+            for job in jobs:
+                futures[pool.submit(self.run_one, *job)] = job
+            for f in as_completed(futures):
+                cred, proto = futures[f][0], futures[f][1]
+                try:
+                    f.result()
+                except Exception as exc:
+                    # A job that raised produced no cell of its own, and an
+                    # empty cell renders '-'. Say what actually happened.
+                    self.record_job_error(
+                        cred, proto, "salvo raised while running this job: {}".format(exc))
+                    sys.stderr.write("[!] {} as {}: {}\n".format(proto, cred.user, exc))
         except KeyboardInterrupt:
-            # Do not lose the run. Stop the processes, keep the results, let
-            # main() render and persist what was already learned.
             self.abort.set()
             self.kill_all()
-            sys.stderr.write("\n[!] interrupted - keeping results gathered so far\n")
+            for f in futures:
+                f.cancel()
+            sys.stderr.write("\n[!] interrupted - nxc killed, keeping results "
+                             "gathered so far\n")
         finally:
+            pool.shutdown(wait=True)
             if self.state:
                 self.state.save()
         print("\n[*] finished in {:.0f}s".format(time.time() - started))
@@ -948,7 +1169,7 @@ def quote(s):
 
 
 def fmt_live(hit):
-    tag = {
+    tags = {
         ADMIN: "[ADMIN]",
         EXEC: "[EXEC ]",
         VALID: "[  +  ]",
@@ -959,7 +1180,9 @@ def fmt_live(hit):
         NO_SERVICE: "[ nosvc]",
         ERROR: "[ err ]",
         USAGE: "[!CMD ]",
-    }[hit.status]
+        NOT_RUN: "[ n/a ]",
+    }
+    tag = tags.get(hit.status, "[{:^5}]".format(hit.status[:5]))
     return "{:8} {:6} {:<16} {:<16} {}".format(
         tag, hit.proto, hit.ip, hit.host[:16], hit.cred.user
     )
@@ -1008,16 +1231,36 @@ def ordered_hosts(hits):
     return OrderedDict((ip, names.get(ip, ip)) for ip in sorted(ips, key=ip_sort_key))
 
 
-def render_matrix(hits, protocols, markdown=False, not_run=None):
+def render_matrix(hits, protocols, markdown=False, overlay=None):
     """
-    not_run maps (cred.key, protocol) to the reason salvo ran no job for it.
-    Those cells render 'n/a' rather than '-': one is a fact about salvo, the
-    other is a fact about the host, and collapsing them is the exact failure
-    this tool exists to remove.
+    overlay maps (cred.key, protocol) to (status, reason) for a job that
+    produced no result of its own - skipped, rejected by nxc, or errored.
+
+    Those cells carry the overlay's glyph rather than '-'. A '-' is a fact
+    about the host; every overlay entry is a fact about salvo, and collapsing
+    the two is the exact failure this tool exists to remove.
     """
-    not_run = not_run or {}
+    overlay = overlay or {}
+
+    def reason_lines(ckey, indent="  "):
+        grouped = {}
+        for p in protocols:
+            entry = overlay.get((ckey, p))
+            if entry:
+                grouped.setdefault(entry, []).append(p)
+        return ["{}{:<5} {:<20} {}".format(indent, GLYPH[st], ", ".join(ps), why)
+                for (st, why), ps in sorted(grouped.items(),
+                                            key=lambda kv: (kv[0][0], kv[1]))]
+
     if not hits:
-        return "no results.\n"
+        if not overlay:
+            return "no results.\n"
+        # Nothing answered anywhere, but salvo still knows why it ran nothing,
+        # and that is the whole message.
+        out = ["", "No host produced a result. Nothing here is a verdict:"]
+        for ckey in sorted({k for k, _ in overlay}):
+            out.extend(reason_lines(ckey))
+        return "\n".join(out) + "\n"
 
     best = collapse(hits)
     creds = ordered_creds(hits)
@@ -1036,18 +1279,12 @@ def render_matrix(hits, protocols, markdown=False, not_run=None):
                     if hit.status in (ADMIN, EXEC, VALID, CRED_OK_ACCESS_NO,
                                       INCONCLUSIVE, LOCKED):
                         any_signal = True
-                elif (ckey, p) in not_run:
-                    cells.append(GLYPH[NOT_RUN])
+                elif (ckey, p) in overlay:
+                    cells.append(GLYPH[overlay[(ckey, p)][0]])
                 else:
                     cells.append("")
             label = ip if hostname in ("-", ip, "") else "{} ({})".format(ip, hostname)
             rows.append((label, cells, any_signal))
-
-        reasons = {}
-        for p in protocols:
-            why = not_run.get((ckey, p))
-            if why:
-                reasons.setdefault(why, []).append(p)
 
         if markdown:
             out.append("\n### {}\n".format(cred.label))
@@ -1055,8 +1292,8 @@ def render_matrix(hits, protocols, markdown=False, not_run=None):
             out.append("|---" * (len(protocols) + 1) + "|")
             for label, cells, _ in rows:
                 out.append("| {} | ".format(label) + " | ".join(c or GLYPH[NO_SERVICE] for c in cells) + " |")
-            for why, ps in sorted(reasons.items()):
-                out.append("\n`n/a` **{}** - {}".format(", ".join(ps), why))
+            for line in reason_lines(ckey, indent=""):
+                out.append("\n`" + line.strip() + "`")
         else:
             out.append("\n" + "=" * 78)
             out.append(" {}".format(cred.label))
@@ -1069,8 +1306,7 @@ def render_matrix(hits, protocols, markdown=False, not_run=None):
                 mark = " <" if sig else ""
                 out.append("{:<{w}}".format(label, w=width)
                            + "".join("{:>8}".format(c or GLYPH[NO_SERVICE]) for c in cells) + mark)
-            for why, ps in sorted(reasons.items()):
-                out.append("  n/a  {:<20} {}".format(", ".join(ps), why))
+            out.extend(reason_lines(ckey))
     out.append("")
     out.append("  ADMIN  = provably administrative (smb admin-share write, mssql sysadmin)")
     out.append("  exec   = code execution, NOT admin - check the smb column before assuming")
@@ -1078,6 +1314,7 @@ def render_matrix(hits, protocols, markdown=False, not_run=None):
     out.append("  ?      = cannot tell, retest elsewhere    . = refused    - = no service / no answer")
     out.append("  !CMD   = nxc REJECTED the command salvo built - this cell was never tested")
     out.append("  n/a    = salvo ran NO job here - a fact about salvo, not about the host")
+    out.append("  err    = salvo could not run this job - also not a verdict")
     out.append("  <      = this host answered on at least one protocol")
     out.append("")
     return "\n".join(out) + "\n"
@@ -1279,13 +1516,28 @@ def selftest():
     return 0
 
 
+def nxc_version(nxc_bin):
+    """
+    Which NetExec produced this report. salvo reads nxc's human-readable
+    output, so a result is only interpretable against a known version, and a
+    report handed to a client should say which one it was.
+    """
+    try:
+        r = subprocess.run([nxc_bin, "--version"], capture_output=True,
+                           text=True, timeout=30)
+    except Exception:
+        return None
+    text = ((r.stdout or "") + (r.stderr or "")).strip()
+    return text.splitlines()[0].strip() if text else None
+
+
 def check_nxc(nxc_bin, protocols):
     """
     Compare salvo's capability tables against what the installed nxc really
     accepts. Run this after any NetExec upgrade.
     """
-    print("\n  protocol   -d      --local-auth   timeout flag")
-    print("  " + "-" * 56)
+    print("\n  protocol   -d     --local-auth  -H     cont   timeout flag")
+    print("  " + "-" * 68)
     drift = []
     for proto in protocols:
         try:
@@ -1297,6 +1549,10 @@ def check_nxc(nxc_bin, protocols):
             continue
         has_d = (" -d " in h or "--domain" in h)
         has_la = ("--local-auth" in h)
+        has_hash = (" -H " in h or "--hash" in h)
+        # salvo sends this to every protocol unconditionally; without it nxc
+        # stops at the first hit and every column below that is a lie
+        has_cont = ("--continue-on-success" in h)
         tflag = TIMEOUT_FLAG.get(proto)
         # Every --*-timeout this protocol's parser advertises. Checking only
         # the flag salvo already knows about can confirm the table but can
@@ -1310,15 +1566,23 @@ def check_nxc(nxc_bin, protocols):
             shown = "none set - nxc offers " + ",".join(offered)
         else:
             shown = "none"
-        print("  {:<10} {:<7} {:<14} {}".format(
+        print("  {:<10} {:<6} {:<13} {:<6} {:<6} {}".format(
             proto,
             "yes" if has_d else "no",
             "yes" if has_la else "no",
+            "yes" if has_hash else "no",
+            "yes" if has_cont else "NO",
             shown))
         if has_d != (proto in DOMAIN_CAPABLE):
             drift.append("DOMAIN_CAPABLE is wrong for {}".format(proto))
         if has_la != (proto in LOCAL_AUTH_CAPABLE):
             drift.append("LOCAL_AUTH_CAPABLE is wrong for {}".format(proto))
+        if has_hash != (proto in HASH_CAPABLE):
+            drift.append("HASH_CAPABLE is wrong for {}".format(proto))
+        if not has_cont:
+            drift.append("nxc {} does not define --continue-on-success, which "
+                         "salvo sends to every protocol - every {} job would be "
+                         "rejected".format(proto, proto))
         if tflag and not has_t:
             drift.append("TIMEOUT_FLAG[{}] = {} no longer exists".format(proto, tflag))
         if not tflag and offered:
@@ -1390,6 +1654,9 @@ creds.txt format
 """,
     )
 
+    ap.add_argument("--version", action="version",
+                    version="salvo {}".format(__version__))
+
     ap.add_argument("targets", nargs="*",
                     help="IPs, ranges, CIDRs, hostnames, or a file of them - anything nxc accepts")
 
@@ -1406,11 +1673,14 @@ creds.txt format
     g = ap.add_argument_group("scope")
     g.add_argument("-P", "--protocols", default=",".join(DEFAULT_PW_PROTOCOLS),
                    help="comma list, or 'all'. default: " + ",".join(DEFAULT_PW_PROTOCOLS))
-    g.add_argument("--parallel", type=int, default=6,
+    # These default to None, not to their value, so --slow and --stealth can
+    # fill in only what the operator left unset. A preset is a default, not an
+    # override: '--nxc-timeout 60 --slow' has to stay 60.
+    g.add_argument("--parallel", type=int, default=None,
                    help="concurrent nxc processes (default 6)")
-    g.add_argument("--nxc-threads", type=int, default=25,
+    g.add_argument("--nxc-threads", type=int, default=None,
                    help="nxc's own -t per process (default 25, drop to 5 over a slow tunnel)")
-    g.add_argument("--nxc-timeout", type=int, default=15,
+    g.add_argument("--nxc-timeout", type=int, default=None,
                    help="seconds for nxc's PER-PROTOCOL timeout flag (default 15). "
                         "nxc's global --timeout is deprecated upstream and silently "
                         "ignored, so salvo emits --smb-timeout / --rpc-timeout / etc "
@@ -1492,18 +1762,34 @@ creds.txt format
     if not args.targets:
         sys.exit("[!] no targets given.")
 
+    # --stealth wins over --slow when both are given; anything the operator
+    # set explicitly wins over both.
+    TUNING_DEFAULTS = {"parallel": 6, "nxc_threads": 25, "nxc_timeout": 15}
+    preset = {}
     if args.slow:
-        args.parallel, args.nxc_threads, args.nxc_timeout = 3, 5, 30
-
+        preset = {"parallel": 3, "nxc_threads": 5, "nxc_timeout": 30}
     if args.stealth:
         # Eight protocols fired at once across a subnet is a wall of failed
         # logons from one source address. This makes it a trickle instead:
         # one process, one thread, spaced apart at both levels.
-        args.parallel, args.nxc_threads, args.nxc_timeout = 1, 1, 30
+        preset = {"parallel": 1, "nxc_threads": 1, "nxc_timeout": 30}
+    explicit = {k for k in TUNING_DEFAULTS if getattr(args, k) is not None}
+    for name, fallback in TUNING_DEFAULTS.items():
+        if getattr(args, name) is None:
+            setattr(args, name, preset.get(name, fallback))
+    if preset and explicit:
+        print("[*] keeping your explicit {} over the preset".format(
+            ", ".join("--" + e.replace("_", "-") for e in sorted(explicit))))
+
+    if args.parallel < 1 or args.nxc_threads < 1:
+        sys.exit("[!] --parallel and --nxc-threads must be at least 1")
+
+    if args.stealth:
         args.jitter = args.jitter or "3-7"
         args.job_delay = args.job_delay or 5.0
-        print("[*] --stealth: 1 process at a time, 1 nxc thread, jitter {}, "
-              "{:.0f}s between jobs.".format(args.jitter, args.job_delay))
+        print("[*] --stealth: {} process(es) at a time, {} nxc thread(s), "
+              "jitter {}, {:.0f}s between jobs.".format(
+                  args.parallel, args.nxc_threads, args.jitter, args.job_delay))
         print("    This is slow ON PURPOSE. A full 8-protocol sweep of one host "
               "will take minutes, not seconds.\n")
 
@@ -1526,6 +1812,15 @@ creds.txt format
     if not args.dry_run and not shutil.which(args.nxc_bin):
         sys.exit("[!] '{}' not found on PATH. Install NetExec or pass --nxc-bin.".format(args.nxc_bin))
 
+    # salvo parses nxc's human-readable output, so a result is only
+    # interpretable against a known nxc. A report that cannot name the version
+    # that produced it is a report nobody can reproduce.
+    nxc_ver = None
+    if not args.dry_run:
+        nxc_ver = nxc_version(args.nxc_bin)
+        print("[*] salvo {}  |  {}".format(
+            __version__, nxc_ver or "nxc version could not be read"))
+
     # targets: drop exact repeats, keep the order given
     targets = []
     for t in args.targets:
@@ -1540,7 +1835,12 @@ creds.txt format
     if args.creds:
         if not os.path.isfile(args.creds):
             sys.exit("[!] no such creds file: " + args.creds)
-        raw_creds += parse_cred_file(args.creds)
+        parsed, problems = parse_cred_file(args.creds)
+        raw_creds += parsed
+        for problem in problems:
+            print("[!] {}: {}".format(args.creds, problem))
+        if problems:
+            print("    Those credentials are NOT being tested.\n")
     if args.user:
         if args.password and args.nthash:
             # Silently preferring one would put a credential in the report that
@@ -1585,6 +1885,11 @@ creds.txt format
     if bad:
         sys.exit("[!] unknown protocol(s): {}. valid: {}".format(",".join(bad), ",".join(ALL_PROTOCOLS)))
 
+    from_file_hashes = sorted({c.user for c in creds if c.is_hash}) if args.creds else []
+    if from_file_hashes:
+        print("[*] read as NT hashes: {} - a 32-hex-character password would be "
+              "auto-detected the same way".format(", ".join(from_file_hashes)))
+
     if any(c.is_hash for c in creds):
         skipped = [p for p in protocols if p not in HASH_CAPABLE]
         if skipped:
@@ -1596,11 +1901,24 @@ creds.txt format
     if "vnc" in protocols:
         print("[*] note: nxc vnc authenticates with a password only, the username is ignored")
 
+    # Every output path is checked before a single logon is spent. A run that
+    # sprays for two hours and then cannot write its report has lost the run,
+    # and the authentication attempts are not refundable.
+    if args.jsonout:
+        ensure_writable(args.jsonout, "--json")
+    if args.state:
+        ensure_writable(args.state, "--state")
+
     if args.logdir:
         # Only tighten a directory salvo created. Clamping one the user already
         # had would be an unasked-for change to something outside our scope.
         fresh = not os.path.isdir(args.logdir)
-        os.makedirs(args.logdir, exist_ok=True)
+        try:
+            os.makedirs(args.logdir, exist_ok=True)
+        except OSError as exc:
+            sys.exit("[!] cannot create --logdir {}: {}".format(args.logdir, exc))
+        if not os.access(args.logdir, os.W_OK):
+            sys.exit("[!] --logdir is not writable: " + args.logdir)
         if fresh:
             os.chmod(args.logdir, PRIVATE_DIR_MODE)
         elif (os.stat(args.logdir).st_mode & 0o077):
@@ -1642,35 +1960,43 @@ creds.txt format
     # which member server you authenticated against. So the bill is
     # protocols x hosts, not protocols. Counted on the jobs that will ACTUALLY
     # run, so a resumed run does not warn about attempts it is not making.
-    exact_hosts = (len(args.targets)
-                   if all(LITERAL_IP.match(t) for t in args.targets) else None)
+    # CIDRs, ranges and target files are expanded rather than shrugged at.
+    # "N per host, host count unknown" leaves the operator doing the one
+    # multiplication the warning exists to do for them.
+    host_count = count_hosts(args.targets)
 
     protos_per_user = {}
     for cred, proto, _t, _s in jobs:
         protos_per_user[cred.user] = protos_per_user.get(cred.user, 0) + 1
-    if protos_per_user:
-        worst_user, n_proto = max(sorted(protos_per_user.items()), key=lambda kv: kv[1])
-        if exact_hosts is not None:
-            total = n_proto * exact_hosts
-            detail = "{} logons ({} protocol-jobs x {} hosts)".format(
-                total, n_proto, exact_hosts)
-        else:
-            total = n_proto
-            detail = "{} logons PER HOST, and the target spec is a range or file " \
-                     "so the host count is unknown".format(n_proto)
-        if total > 3:
-            print("[!] LOCKOUT MATH: '{}' will take up to {}.".format(worst_user, detail))
-            print("    A domain account's counter is on the DC, so every host counts.")
-            print("    Default AD lockout threshold is often 5. Check it first:")
-            print("        nxc smb <DC_IP> -u '' -p '' --pass-pol")
-            print("    Narrow with -P smb,winrm if that number is too close.\n")
+
+    # Every account at risk, not just the worst one. A second account also
+    # over the threshold is a second lockout.
+    at_risk = []
+    for user, n_proto in sorted(protos_per_user.items()):
+        worst = n_proto * host_count if host_count is not None else n_proto
+        if worst > 3:
+            at_risk.append((user, n_proto, worst))
+
+    if at_risk:
+        print("[!] LOCKOUT MATH - each protocol against each host is a separate logon,")
+        print("    and a domain account's counter lives on the DC, so every host counts.")
+        for user, n_proto, worst in at_risk:
+            if host_count is None:
+                print("      {:<24} up to {} logons PER HOST ({} protocol-jobs; the "
+                      "target list could not be counted)".format(user, n_proto, n_proto))
+            else:
+                print("      {:<24} up to {} logons ({} protocol-jobs x {} hosts)"
+                      .format(user, worst, n_proto, host_count))
+        print("    Default AD lockout threshold is often 5. Check it first:")
+        print("        nxc smb <DC_IP> -u '' -p '' --pass-pol")
+        print("    Narrow with -P smb,winrm, or spread it out with --stealth.\n")
 
     # ---- go --------------------------------------------------------------
     runner.execute(jobs)
     runner.finalize()
 
     print(render_matrix(runner.hits, protocols, markdown=args.markdown,
-                        not_run=runner.not_run))
+                        overlay=runner.overlay))
 
     # what the run actually cost, as opposed to the worst case warned about
     real = runner.attempts_made()
@@ -1698,16 +2024,36 @@ creds.txt format
         print("  {} job(s) never ran - nxc rejected the command salvo built.".format(
             len(runner.job_failures)))
         print("  Those cells are marked !CMD. They are NOT a statement about the target.")
-        for proto, user, rc, msg in sorted(runner.job_failures):
-            print("    {:6} {:<20} exit {}  {}".format(proto, user, rc, msg[:90]))
+        for proto, cred, rc, msg in sorted(runner.job_failures,
+                                           key=lambda f: (f[0], f[1].user)):
+            print("    {:6} {:<20} exit {}  {}".format(proto, cred.user, rc, msg[:90]))
         print("\n  asking nxc which flag it objected to:")
         for line in runner.diagnose_failures():
             print(line)
         print("!" * 70 + "\n")
 
-    for note in runner.advisories():
+    if runner.job_errors:
+        print("!" * 70)
+        print("  {} job(s) could not be run by salvo at all.".format(len(runner.job_errors)))
+        print("  Those cells are marked err. They are NOT a statement about the target.")
+        for proto, user, msg in sorted(runner.job_errors):
+            print("    {:6} {:<20} {}".format(proto, user, msg[:100]))
+        print("!" * 70 + "\n")
+
+    # An impacket target is parsed positionally as domain/user:password@host,
+    # so a password carrying one of its separators makes the pasted command
+    # mean something else. Cheaper to say than to debug at 2am.
+    risky = sorted({c.user for c in creds
+                    if not c.is_hash and any(ch in c.secret for ch in "@:/")})
+    if risky:
+        print("[!] the password for {} contains @, : or / - impacket parses "
+              "domain/user:password@target positionally, so the commands above "
+              "need care rather than a straight paste.\n".format(", ".join(risky)))
+
+    notes = runner.advisories()   # computed once: it probes and it is not free
+    for note in notes:
         print("[!] " + note)
-    if runner.advisories():
+    if notes:
         print("")
 
     if args.jsonout:
@@ -1731,9 +2077,16 @@ creds.txt format
                            proto_rank.get(r["protocol"], 99)),
         )
         write_json_atomic(args.jsonout, {
-            "generated": datetime.now().isoformat(timespec="seconds"),
+            # Provenance first: a report that cannot say what produced it, from
+            # where, against what, is not evidence.
+            "salvo_version": __version__,
+            "nxc_version": nxc_ver,
+            "generated": now_iso(),
             "targets": args.targets,
+            "host_count": host_count,
             "protocols": protocols,
+            # exactly what was sent at the estate, for the client who asks
+            "commands": sorted(runner.commands),
             "results": results,
             "not_run": not_run,
         })
@@ -1749,3 +2102,14 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         sys.exit("\n[!] interrupted")
+    except BrokenPipeError:
+        # Piped into head, less, or a pager the operator quit. Python flushes
+        # stdout again on the way out, which would raise a second time and
+        # print an "Exception ignored" block over their terminal, so point the
+        # descriptor at devnull before exiting.
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except OSError:
+            pass
+        sys.exit(0)

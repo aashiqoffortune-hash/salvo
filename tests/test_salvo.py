@@ -1248,3 +1248,53 @@ class TestBareInvocation(unittest.TestCase):
     def test_a_real_invocation_missing_targets_still_says_so(self):
         r = run_cli("-u", "jdoe", "-p", "Password123!")
         self.assertIn("no targets given", r.stdout + r.stderr)
+
+
+# ---------------------------------------------------------------------------
+# --check-nxc against a fixture transcribed from a real NetExec
+# ---------------------------------------------------------------------------
+
+class TestCheckNxc(unittest.TestCase):
+    def check(self, *extra, **kw):
+        return run_cli("--check-nxc", "--nxc-bin", FAKE_NXC, *extra, **kw)
+
+    def test_the_shipped_tables_agree_with_a_real_nxc(self):
+        """
+        tests/fake_nxc.py reproduces what `nxc <proto> --help` really prints,
+        so this pins salvo's capability tables to observed reality.
+        """
+        r = self.check("-P", "all")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("capability tables match", r.stdout)
+
+    def test_a_generic_nxc_flag_is_not_reported_as_missing(self):
+        """
+        Regression: --dns-timeout belongs to nxc's generic parser and is
+        printed under every protocol, so it was flagged as a per-protocol
+        timeout salvo was failing to send. Acting on that advice would have
+        made --nxc-timeout set name-resolution time instead of connection
+        time - a different knob, changed silently.
+        """
+        r = self.check("-P", "all")
+        self.assertNotIn("--dns-timeout", r.stdout)
+        self.assertNotIn("TIMEOUT_FLAG has no entry", r.stdout)
+        for proto in ("ldap", "ftp", "vnc"):
+            row = [l for l in r.stdout.splitlines() if l.strip().startswith(proto)][0]
+            self.assertTrue(row.rstrip().endswith("none"), row)
+
+    def test_a_generic_flag_is_ignored_even_for_a_single_protocol(self):
+        """The intersection rule cannot help here; the known list must."""
+        r = self.check("-P", "ldap")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("--dns-timeout", r.stdout)
+
+    def test_a_real_disagreement_is_still_caught(self):
+        r = self.check("-P", "smb,ldap", env={"FAKE_NXC_DRIFT": "1"})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("LOCAL_AUTH_CAPABLE is wrong for smb", r.stdout)
+
+    def test_ldap_takes_a_domain_but_not_local_auth(self):
+        """The trap the capability tables exist for, asserted end to end."""
+        r = self.check("-P", "ldap")
+        row = [l for l in r.stdout.splitlines() if l.strip().startswith("ldap")][0]
+        self.assertRegex(row, r"ldap\s+yes\s+no\s+yes")

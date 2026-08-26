@@ -408,9 +408,17 @@ def _count_one(target, follow_files=True):
         return sum(_count_one(e, follow_files=False) or 1 for e in entries)
     return 1   # a hostname is one host
 
-# any per-protocol timeout flag in an nxc --help, including ones salvo's
-# TIMEOUT_FLAG table has never heard of
+# any timeout flag in an nxc --help, including ones salvo's TIMEOUT_FLAG table
+# has never heard of
 TIMEOUT_ANY_RE = re.compile(r"--[a-z0-9]+-timeout")
+
+# Timeout flags that belong to nxc's GENERIC parser rather than to a protocol.
+# `nxc <proto> --help` prints the generic options under every protocol, so
+# these turn up in all ten and must not be mistaken for a per-protocol flag
+# salvo is failing to send. Putting --dns-timeout in TIMEOUT_FLAG would make
+# --nxc-timeout set name-resolution time instead of connection time: a
+# different knob, changed silently.
+KNOWN_GENERIC_TIMEOUT_FLAGS = frozenset(["--dns-timeout"])
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 LINE_RE = re.compile(
@@ -1678,16 +1686,35 @@ def check_nxc(nxc_bin, protocols):
     Compare salvo's capability tables against what the installed nxc really
     accepts. Run this after any NetExec upgrade.
     """
-    print("\n  protocol   -d     --local-auth  -H     cont   timeout flag")
-    print("  " + "-" * 68)
-    drift = []
+    # Read every protocol's help first, so a flag can be judged against the
+    # others rather than in isolation.
+    helps = {}
     for proto in protocols:
         try:
             r = subprocess.run([nxc_bin, proto, "--help"],
                                capture_output=True, text=True, timeout=60)
-            h = (r.stdout or "") + (r.stderr or "")
-        except Exception as e:
-            print("  {:<10} could not run: {}".format(proto, e))
+            helps[proto] = (r.stdout or "") + (r.stderr or "")
+        except Exception as exc:
+            helps[proto] = None
+            print("  {:<10} could not run: {}".format(proto, exc))
+
+    # A timeout flag every probed protocol offers is a generic nxc option, not
+    # one salvo is failing to send. Two independent rules, because each covers
+    # the other's blind spot: the known list still works when only one protocol
+    # is probed, and the intersection still works when upstream adds a generic
+    # flag this list has never heard of.
+    offered_by = {p: set(TIMEOUT_ANY_RE.findall(h))
+                  for p, h in helps.items() if h is not None}
+    generic = set(KNOWN_GENERIC_TIMEOUT_FLAGS)
+    if len(offered_by) >= 2:
+        generic |= set.intersection(*offered_by.values())
+
+    print("\n  protocol   -d     --local-auth  -H     cont   timeout flag")
+    print("  " + "-" * 68)
+    drift = []
+    for proto in protocols:
+        h = helps.get(proto)
+        if h is None:
             continue
         has_d = (" -d " in h or "--domain" in h)
         has_la = ("--local-auth" in h)
@@ -1700,7 +1727,7 @@ def check_nxc(nxc_bin, protocols):
         # the flag salvo already knows about can confirm the table but can
         # never catch upstream ADDING one, which is the direction that costs
         # you a false '-' over a tunnel.
-        offered = sorted(set(TIMEOUT_ANY_RE.findall(h)))
+        offered = sorted(offered_by.get(proto, set()) - generic)
         has_t = (tflag in offered) if tflag else False
         if tflag:
             shown = tflag + (" ok" if has_t else " MISSING")

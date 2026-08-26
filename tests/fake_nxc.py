@@ -20,12 +20,34 @@ arrange on a live range:
     FAKE_NXC_LOCKOUT=1   answer STATUS_ACCOUNT_LOCKED_OUT on the first host
     FAKE_NXC_BINARY=1    emit an invalid UTF-8 byte in a hostname
     FAKE_NXC_HANG=1      sleep, so kill paths can be exercised
+    FAKE_NXC_DRIFT=1     drop --local-auth from smb\'s help, so --check-nxc
+                         can be shown to still catch a real disagreement
+
+`<proto> --help` reproduces what a real NetExec 1.x reports, transcribed from
+an actual `nxc <proto> --help` on Kali. That makes --check-nxc testable without
+NetExec installed, and pins salvo\'s capability tables to observed reality
+rather than to salvo\'s own beliefs about it.
 """
 
 import os
 import sys
 
 HOSTS = [("10.0.0.10", "DC01", 1), ("10.0.0.11", "WEB01", 2)]
+
+# (accepts -d, accepts --local-auth, accepts -H, own timeout flag)
+CAPABILITIES = {
+    "smb":   (True,  True,  True,  "--smb-timeout"),
+    "winrm": (True,  True,  True,  "--http-timeout"),
+    "wmi":   (True,  True,  True,  "--rpc-timeout"),
+    "mssql": (True,  True,  True,  "--mssql-timeout"),
+    # the trap: ldap takes -d but not --local-auth, a bind is domain-scoped
+    "ldap":  (True,  False, True,  None),
+    "rdp":   (True,  True,  True,  "--rdp-timeout"),
+    "ssh":   (False, False, False, "--ssh-timeout"),
+    "ftp":   (False, False, False, None),
+    "nfs":   (False, False, False, "--nfs-timeout"),
+    "vnc":   (False, False, False, None),
+}
 
 PORTS = {"smb": 445, "winrm": 5985, "wmi": 135, "mssql": 1433,
          "ldap": 389, "rdp": 3389, "ssh": 22, "ftp": 21, "nfs": 111, "vnc": 5900}
@@ -53,6 +75,36 @@ def parse():
     return proto, targets, user
 
 
+def emit_help(proto):
+    """What `nxc <proto> --help` really prints, in the parts salvo reads."""
+    takes_domain, takes_local, takes_hash, timeout_flag = CAPABILITIES[proto]
+    if os.environ.get("FAKE_NXC_DRIFT") and proto == "smb":
+        takes_local = False          # a real disagreement, to prove it is caught
+
+    print("usage: nxc {} [-h] ...".format(proto))
+    print("\noptions:")
+    print("  -h, --help            show this help message and exit")
+    print("  -t THREADS            number of concurrent threads")
+    print("  --jitter INTERVAL     sleep between requests")
+    print("  --no-progress         do not displaying progress bars")
+    # Generic, printed under EVERY protocol. salvo must not mistake it for a
+    # per-protocol flag it is failing to send.
+    print("  --dns-timeout DNS_TIMEOUT   DNS query timeout in seconds")
+    print("\nauthentication:")
+    print("  -u USERNAME           username(s) or file containing usernames")
+    print("  -p PASSWORD           password(s) or file containing passwords")
+    if takes_domain:
+        print("  -d DOMAIN, --domain DOMAIN   domain to authenticate to")
+    if takes_hash:
+        print("  -H HASH, --hash HASH  NTLM hash(es) or file containing hashes")
+    if takes_local:
+        print("  --local-auth          authenticate locally to each target")
+    print("  --continue-on-success  continue authentication after a success")
+    if timeout_flag:
+        print("  {} SECONDS   {} connection timeout".format(timeout_flag, proto))
+    return 0
+
+
 def main():
     if "--version" in sys.argv[1:]:
         print("nxc 1.5.0-fake")
@@ -70,6 +122,11 @@ def main():
     proto, _targets, user = parse()
     if proto is None:
         return 2
+
+    if "--help" in sys.argv[1:] or "-h" in sys.argv[1:]:
+        if proto not in CAPABILITIES:
+            return 2
+        return emit_help(proto)
     port = PORTS.get(proto, 445)
     tag = proto.upper()
 

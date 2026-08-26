@@ -1,5 +1,7 @@
 # salvo
 
+[![tests](https://github.com/aashiqoffortune-hash/salvo/actions/workflows/tests.yml/badge.svg)](https://github.com/aashiqoffortune-hash/salvo/actions/workflows/tests.yml)
+
 Spray one or many credentials across **every NetExec protocol at once** and read the result as a matrix.
 
 ![salvo: one credential fanned out across every NetExec protocol, read back as a single matrix](sketch.svg)
@@ -18,6 +20,7 @@ host                       smb   winrm     wmi   mssql    ldap     rdp     ssh  
   ok     = authenticated    VALID* = password correct, this access path blocked
   ?      = cannot tell, retest elsewhere    . = refused    - = no service / no answer
   !CMD   = nxc REJECTED the command salvo built - this cell was never tested
+  n/a    = salvo ran NO job here - a fact about salvo, not about the host
 ```
 
 Stdlib only. No pip, no virtualenv, no dependencies beyond `nxc` itself.
@@ -64,6 +67,31 @@ NEXT:
       evil-winrm -i 192.168.100.25 -u jdoe -p 'Password123!'   # NOT local admin here - expect to land as a standard user
 ```
 
+### 3. A cell salvo never tested says so
+
+Some jobs are never worth running: you cannot pass-the-hash over `ssh`, `ftp`,
+`nfs` or `vnc`, and `nxc ldap` has no `--local-auth` because a directory bind is
+always domain-scoped. salvo skips those rather than spending a logon to learn
+nothing.
+
+Skipping them quietly costs something, though. An absent result leaves an empty
+cell, an empty cell reads as `-`, and `-` is defined right there in the legend as
+*no service / no answer* — a claim about the target. Nothing was ever sent.
+
+Those cells render **`n/a`**, with the reason printed under the table:
+
+```
+host                       smb   winrm     ssh     ftp
+------------------------------------------------------
+192.168.100.25 (WEB01)   ADMIN       -     n/a     n/a <
+  n/a  ssh, ftp             nxc defines no -H here, so a hash cannot be tested over this protocol
+```
+
+`-` is a statement about the host. `n/a` is a statement about salvo. They are
+different facts and the matrix keeps them apart. `--json` carries the same
+distinction in a `not_run` array, so a consumer of the file is not left to infer
+it from an absence.
+
 ---
 
 ## Install
@@ -107,7 +135,8 @@ Administrator:31d6cfe0d16ae931b73c59d7e0c089c0
 CORP\svc_sql:Winter2026!
 ```
 
-Hash credentials automatically skip `ssh`, `ftp`, `nfs` and `vnc` — you cannot pass-the-hash over those.
+Hash credentials automatically skip `ssh`, `ftp`, `nfs` and `vnc` — you cannot
+pass-the-hash over those. Those cells render `n/a`, not `-`.
 
 ---
 
@@ -201,6 +230,36 @@ If you are operating under rules that restrict tooling, confirm those rules your
 - **Advisory on undeclared domains.** If a target's SMB banner advertises a domain you didn't pass with `-d`, it says so — `ldap` and Kerberos-backed results are unreliable without it.
 - Parsing is against `nxc`'s human-readable output. A future format change upstream could break it; `--logdir` keeps the raw text either way.
 
+## Tests
+
+Stdlib `unittest`, no pip, no virtualenv — the same rule as salvo itself. On a
+fresh clone:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+72 tests covering the verdict table, the `nxc` command builder, planning and
+resume, matrix rendering and its determinism, credential parsing, and file
+permissions. Three are worth naming:
+
+- **the scope invariant** — every credential shape against every protocol, then
+  assert that no execution or dumping flag (`-x`, `-X`, `-M`, `--sam`, `--lsa`,
+  `--ntds`, …) ever appears in a built command line, and that every flag salvo
+  *does* emit is on an explicit allowlist. The authentication-only design rule is
+  asserted, not just documented, and a flag added later fails the suite until
+  someone consciously allows it.
+- **the parser corpus** — the `--selftest` line formats, asserted rather than
+  printed, so a NetExec output change breaks CI instead of a live run.
+- **end to end against a fake nxc** — `tests/fake_nxc.py` emits real nxc line
+  shapes, so the whole path (subprocess, parser, log writer, resume store,
+  matrix, JSON) runs with no network and no NetExec install. It covers the
+  cases that are awkward to reach on a live range: a resumed run spending no
+  further logons, and a command nxc rejects being marked `!CMD` and left
+  unrecorded so the next run retries it.
+
+CI runs the suite plus `--selftest` on Python 3.8 through 3.13.
+
 ## Credits
 
 Built on [NetExec](https://github.com/Pennyw0rth/NetExec) by @NeffIsBack, @MJHallenbeck and @\_zblurx. Multi-protocol mode is [an open feature request upstream](https://github.com/Pennyw0rth/NetExec/issues/1249); until it lands, this wraps it.
@@ -232,10 +291,15 @@ because a bare username is a different test from a domain one.
 
 nxc's global `--timeout` is deprecated upstream and silently ignored. salvo emits
 the per-protocol flag instead — `--smb-timeout`, `--http-timeout`, `--rpc-timeout`,
-`--mssql-timeout`, `--ldap-timeout`, `--rdp-timeout`, `--ssh-timeout`,
-`--nfs-timeout`. This matters over a tunnel: nxc's own defaults are 2s for SMB
-and 3s for LDAP, short enough to time out on latency and report a live host as
-dead. `ftp` and `vnc` expose no timeout flag.
+`--mssql-timeout`, `--rdp-timeout`, `--ssh-timeout`, `--nfs-timeout`. This matters
+over a tunnel: nxc's own defaults are 2s for SMB and 3s for LDAP, short enough to
+time out on latency and report a live host as dead.
+
+`ldap`, `ftp` and `vnc` have no entry in that table, so `--nxc-timeout` does not
+reach them and they run at nxc's own default. `--check-nxc` reads the installed
+nxc's help and reports the gap in **both** directions — a flag salvo sends that
+no longer exists, and a per-protocol timeout your nxc offers that salvo is not
+using. The second is the one that costs you a false `-` over a tunnel.
 
 ### Keeping it honest as NetExec moves
 
@@ -247,6 +311,14 @@ salvo --check-nxc -P all  # capability tables vs the nxc you have installed
 Run both after any NetExec upgrade. If a job is ever rejected mid-run, salvo
 marks the cell `!CMD`, then calls `nxc <proto> --help` itself and names the
 offending flag — a broken command is never allowed to look like a closed port.
+
+## Credentials on disk
+
+Everything salvo writes carries the plaintext credential: `--state` and `--json`
+serialise the secret directly, and every `nxc` log line echoes the password back.
+All three are created **`0600`**, and a `--logdir` that salvo creates is `0700`.
+A log directory you already had is left alone — salvo says so rather than
+changing the permissions of something outside its scope.
 
 ## Operational security
 

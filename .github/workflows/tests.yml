@@ -1,0 +1,38 @@
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    name: python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        os: [ubuntu-latest]
+        include:
+          # salvo claims 3.8+, and 3.8 is not in the ubuntu-24.04 runner image
+          - python: "3.8"
+            os: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # No install step on purpose. salvo is stdlib-only and the suite is
+      # unittest, so if this ever needs a pip install something has regressed.
+      - name: unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: parser self-test
+        run: python salvo.py --selftest
+
+      - name: help renders
+        run: python salvo.py --help > /dev/null

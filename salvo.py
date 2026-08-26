@@ -59,14 +59,36 @@ def ip_sort_key(addr):
     return (1, (), str(addr))
 
 
+# Everything salvo writes to disk carries the plaintext credential: the state
+# file and the --json report serialise `secret` directly, and an nxc log line
+# echoes the password back on every attempt. Default file creation is 0644,
+# which puts those on a shared box for any local account to read. Owner-only
+# is the only defensible mode for any of them.
+PRIVATE_FILE_MODE = 0o600
+PRIVATE_DIR_MODE = 0o700
+
+
+def open_private(path):
+    """open(path, 'w') that never widens past owner read/write."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
+    try:
+        os.fchmod(fd, PRIVATE_FILE_MODE)   # a pre-existing file keeps its old mode otherwise
+    except OSError:
+        pass
+    return os.fdopen(fd, "w")
+
+
 def write_json_atomic(path, obj):
     """
     Write via a temp file and rename. An interrupted write leaves the previous
     file intact rather than a half-parsed one - which matters when the thing
     being written is the state file you are about to resume from.
+
+    The temp file is created owner-only, so the credentials inside it are
+    never briefly world-readable between create and rename.
     """
     tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
+    with open_private(tmp) as fh:
         json.dump(obj, fh, indent=2, sort_keys=True)
         fh.flush()
         os.fsync(fh.fileno())
@@ -111,7 +133,12 @@ TIMEOUT_FLAG = {
     "rdp":   "--rdp-timeout",
     "ssh":   "--ssh-timeout",
     "nfs":   "--nfs-timeout",
-    # ftp, vnc, ldap: nxc defines no per-protocol timeout flag for these
+    # ldap, ftp and vnc have NO entry here, so --nxc-timeout does not reach
+    # them and they run at nxc's own default. This table is a snapshot of
+    # upstream and upstream moves: `salvo --check-nxc` reads the installed
+    # nxc's help and reports a per-protocol timeout flag that exists there but
+    # is missing here, so the gap shows up as a check failure rather than as a
+    # silently unapplied timeout over a tunnel.
 }
 
 # default nxc port per protocol, used only for the follow-up command hints
@@ -142,6 +169,7 @@ LOCKED = "LOCKED"              # account lockout - stop everything
 NO_SERVICE = "NOSVC"           # port closed / no such service on that host
 ERROR = "ERROR"                # nxc itself failed
 USAGE = "USAGE"                # salvo built a command nxc rejected - OUR bug, not the target's
+NOT_RUN = "NOTRUN"             # salvo declined to run this job at all - no packet was sent
 
 # What nxc's "Pwn3d!" actually proves, per protocol. This is not cosmetic:
 #   smb    - Pwn3d means write access to ADMIN$/C$. That IS local admin.
@@ -177,6 +205,7 @@ GLYPH = {
     NO_SERVICE: "-",
     ERROR: "err",
     USAGE: "!CMD",
+    NOT_RUN: "n/a",
 }
 
 # ordering for "which status wins" when one host+protocol produces several lines
@@ -191,6 +220,7 @@ SEVERITY = {
     ERROR: 20,
     INVALID: 10,
     NO_SERVICE: 0,
+    NOT_RUN: -1,   # never competes: it is an absence, not a result
 }
 
 # ---------------------------------------------------------------------------
@@ -232,6 +262,10 @@ STATUS_MAP = [
 AMBIGUOUS_BARE_FAILURE = {"winrm", "rdp", "wmi", "ldap", "mssql"}
 
 LITERAL_IP = re.compile(r"^[0-9]{1,3}(?:\.[0-9]{1,3}){3}$")
+
+# any per-protocol timeout flag in an nxc --help, including ones salvo's
+# TIMEOUT_FLAG table has never heard of
+TIMEOUT_ANY_RE = re.compile(r"--[a-z0-9]+-timeout")
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 LINE_RE = re.compile(
@@ -516,6 +550,7 @@ class Runner:
         self.job_failures = []        # (proto, user, returncode, tail) - nxc refused to run
         self.unparsed = {}            # proto -> count of output lines LINE_RE did not match
         self.parsed = {}              # proto -> count of output lines it did match
+        self.not_run = {}             # (cred.key, proto) -> why no job was ever run
 
     def build_cmd(self, cred, proto, targets):
         """
@@ -600,7 +635,8 @@ class Runner:
 
         # truncating open, not append - a re-run of the same job replaces its
         # log rather than growing it
-        logfh = open(logpath, "w") if logpath else None
+        # owner-only: every nxc line echoes the password back
+        logfh = open_private(logpath) if logpath else None
         clean = False
         tail = deque(maxlen=6)   # last few lines, for when nxc refuses to run
         try:
@@ -840,11 +876,20 @@ class Runner:
         for cred in creds:
             for proto in protocols:
                 if cred.is_hash and proto not in HASH_CAPABLE:
-                    continue  # cannot pass-the-hash over ssh/ftp/nfs/vnc
+                    # cannot pass-the-hash over ssh/ftp/nfs/vnc
+                    # Reason text is deliberately protocol-independent so
+                    # several protocols collapse onto one explanation line.
+                    self.mark_not_run(cred, proto,
+                                      "nxc defines no -H here, so a hash cannot "
+                                      "be tested over this protocol")
+                    continue
                 if cred.local and proto == "ldap":
                     # nxc ldap has no --local-auth: a directory bind is always
                     # domain-scoped. Running it anyway would spend a logon to
                     # learn nothing, and print an INVALID that is not true.
+                    self.mark_not_run(cred, proto,
+                                      "nxc ldap has no --local-auth - a directory "
+                                      "bind is always domain-scoped")
                     continue
                 sig = job_signature(cred, proto, targets)
                 if self.state and self.state.is_done(sig):
@@ -855,6 +900,17 @@ class Runner:
                     continue
                 jobs.append((cred, proto, targets, sig))
         return jobs
+
+    def mark_not_run(self, cred, proto, reason):
+        """
+        Record a job salvo declined to run.
+
+        Dropping it silently is not free. An absent result leaves an empty
+        cell, an empty cell renders as '-', and the legend defines '-' as "no
+        service / no answer" - a claim about the target. Nothing was sent
+        here, so the matrix has to say that instead of implying a closed port.
+        """
+        self.not_run[(cred.key, proto)] = reason
 
     def execute(self, jobs):
         if not jobs:
@@ -952,7 +1008,14 @@ def ordered_hosts(hits):
     return OrderedDict((ip, names.get(ip, ip)) for ip in sorted(ips, key=ip_sort_key))
 
 
-def render_matrix(hits, protocols, markdown=False):
+def render_matrix(hits, protocols, markdown=False, not_run=None):
+    """
+    not_run maps (cred.key, protocol) to the reason salvo ran no job for it.
+    Those cells render 'n/a' rather than '-': one is a fact about salvo, the
+    other is a fact about the host, and collapsing them is the exact failure
+    this tool exists to remove.
+    """
+    not_run = not_run or {}
     if not hits:
         return "no results.\n"
 
@@ -968,15 +1031,23 @@ def render_matrix(hits, protocols, markdown=False):
             any_signal = False
             for p in protocols:
                 hit = best.get((ckey, ip, p))
-                if hit is None:
-                    cells.append("")
-                else:
+                if hit is not None:
                     cells.append(GLYPH[hit.status])
                     if hit.status in (ADMIN, EXEC, VALID, CRED_OK_ACCESS_NO,
                                       INCONCLUSIVE, LOCKED):
                         any_signal = True
+                elif (ckey, p) in not_run:
+                    cells.append(GLYPH[NOT_RUN])
+                else:
+                    cells.append("")
             label = ip if hostname in ("-", ip, "") else "{} ({})".format(ip, hostname)
             rows.append((label, cells, any_signal))
+
+        reasons = {}
+        for p in protocols:
+            why = not_run.get((ckey, p))
+            if why:
+                reasons.setdefault(why, []).append(p)
 
         if markdown:
             out.append("\n### {}\n".format(cred.label))
@@ -984,6 +1055,8 @@ def render_matrix(hits, protocols, markdown=False):
             out.append("|---" * (len(protocols) + 1) + "|")
             for label, cells, _ in rows:
                 out.append("| {} | ".format(label) + " | ".join(c or GLYPH[NO_SERVICE] for c in cells) + " |")
+            for why, ps in sorted(reasons.items()):
+                out.append("\n`n/a` **{}** - {}".format(", ".join(ps), why))
         else:
             out.append("\n" + "=" * 78)
             out.append(" {}".format(cred.label))
@@ -996,12 +1069,15 @@ def render_matrix(hits, protocols, markdown=False):
                 mark = " <" if sig else ""
                 out.append("{:<{w}}".format(label, w=width)
                            + "".join("{:>8}".format(c or GLYPH[NO_SERVICE]) for c in cells) + mark)
+            for why, ps in sorted(reasons.items()):
+                out.append("  n/a  {:<20} {}".format(", ".join(ps), why))
     out.append("")
     out.append("  ADMIN  = provably administrative (smb admin-share write, mssql sysadmin)")
     out.append("  exec   = code execution, NOT admin - check the smb column before assuming")
     out.append("  ok     = authenticated    VALID* = password correct, this access path blocked")
     out.append("  ?      = cannot tell, retest elsewhere    . = refused    - = no service / no answer")
     out.append("  !CMD   = nxc REJECTED the command salvo built - this cell was never tested")
+    out.append("  n/a    = salvo ran NO job here - a fact about salvo, not about the host")
     out.append("  <      = this host answered on at least one protocol")
     out.append("")
     return "\n".join(out) + "\n"
@@ -1222,18 +1298,33 @@ def check_nxc(nxc_bin, protocols):
         has_d = (" -d " in h or "--domain" in h)
         has_la = ("--local-auth" in h)
         tflag = TIMEOUT_FLAG.get(proto)
-        has_t = (tflag in h) if tflag else False
+        # Every --*-timeout this protocol's parser advertises. Checking only
+        # the flag salvo already knows about can confirm the table but can
+        # never catch upstream ADDING one, which is the direction that costs
+        # you a false '-' over a tunnel.
+        offered = sorted(set(TIMEOUT_ANY_RE.findall(h)))
+        has_t = (tflag in offered) if tflag else False
+        if tflag:
+            shown = tflag + (" ok" if has_t else " MISSING")
+        elif offered:
+            shown = "none set - nxc offers " + ",".join(offered)
+        else:
+            shown = "none"
         print("  {:<10} {:<7} {:<14} {}".format(
             proto,
             "yes" if has_d else "no",
             "yes" if has_la else "no",
-            (tflag + (" ok" if has_t else " MISSING")) if tflag else "none"))
+            shown))
         if has_d != (proto in DOMAIN_CAPABLE):
             drift.append("DOMAIN_CAPABLE is wrong for {}".format(proto))
         if has_la != (proto in LOCAL_AUTH_CAPABLE):
             drift.append("LOCAL_AUTH_CAPABLE is wrong for {}".format(proto))
         if tflag and not has_t:
             drift.append("TIMEOUT_FLAG[{}] = {} no longer exists".format(proto, tflag))
+        if not tflag and offered:
+            drift.append("nxc {} accepts {} but TIMEOUT_FLAG has no entry, so "
+                         "--nxc-timeout never reaches it"
+                         .format(proto, " / ".join(offered)))
     print("")
     if drift:
         print("[!] salvo's tables disagree with your nxc:")
@@ -1320,7 +1411,11 @@ creds.txt format
     g.add_argument("--nxc-threads", type=int, default=25,
                    help="nxc's own -t per process (default 25, drop to 5 over a slow tunnel)")
     g.add_argument("--nxc-timeout", type=int, default=15,
-                   help="nxc --timeout seconds (default 15)")
+                   help="seconds for nxc's PER-PROTOCOL timeout flag (default 15). "
+                        "nxc's global --timeout is deprecated upstream and silently "
+                        "ignored, so salvo emits --smb-timeout / --rpc-timeout / etc "
+                        "instead. ldap, ftp and vnc define no such flag and run at "
+                        "nxc's own default - see --check-nxc")
     g.add_argument("--jitter", help="nxc --jitter value, e.g. 2 or 1-3")
     g.add_argument("--job-delay", type=float, default=0.0, metavar="SECS",
                    help="sleep this long before each nxc process starts. nxc's "
@@ -1378,17 +1473,24 @@ creds.txt format
                   else [x.strip().lower() for x in args.protocols.split(",") if x.strip()])
         sys.exit(check_nxc(args.nxc_bin, [x for x in protos if x in ALL_PROTOCOLS]))
 
-    if not args.targets:
-        sys.exit("[!] no targets given.")
-
+    # --forget is a state-file operation, not a run. It must be handled before
+    # the targets guard, or the documented 'salvo --state FILE --forget' exits
+    # with "no targets given" instead of forgetting anything.
     if args.forget:
         if not args.state:
             sys.exit("[!] --forget needs --state FILE")
+        removed = False
         for p in (args.state, args.state + ".tmp"):
             if os.path.isfile(p):
                 os.remove(p)
                 print("[*] removed " + p)
+                removed = True
+        if not removed:
+            print("[*] nothing to forget - no such state file: " + args.state)
         return
+
+    if not args.targets:
+        sys.exit("[!] no targets given.")
 
     if args.slow:
         args.parallel, args.nxc_threads, args.nxc_timeout = 3, 5, 30
@@ -1440,6 +1542,11 @@ creds.txt format
             sys.exit("[!] no such creds file: " + args.creds)
         raw_creds += parse_cred_file(args.creds)
     if args.user:
+        if args.password and args.nthash:
+            # Silently preferring one would put a credential in the report that
+            # was never the one tested.
+            sys.exit("[!] -p and -H are mutually exclusive - pass one, or list "
+                     "both credentials in a -C file")
         if args.password:
             raw_creds.append((args.domain, args.user, args.password, False))
         elif args.nthash:
@@ -1490,7 +1597,15 @@ creds.txt format
         print("[*] note: nxc vnc authenticates with a password only, the username is ignored")
 
     if args.logdir:
+        # Only tighten a directory salvo created. Clamping one the user already
+        # had would be an unasked-for change to something outside our scope.
+        fresh = not os.path.isdir(args.logdir)
         os.makedirs(args.logdir, exist_ok=True)
+        if fresh:
+            os.chmod(args.logdir, PRIVATE_DIR_MODE)
+        elif (os.stat(args.logdir).st_mode & 0o077):
+            print("[*] note: {} is group/world readable and every log in it "
+                  "contains the password.".format(args.logdir))
 
     # ---- resume store ----------------------------------------------------
     state = None
@@ -1554,7 +1669,8 @@ creds.txt format
     runner.execute(jobs)
     runner.finalize()
 
-    print(render_matrix(runner.hits, protocols, markdown=args.markdown))
+    print(render_matrix(runner.hits, protocols, markdown=args.markdown,
+                        not_run=runner.not_run))
 
     # what the run actually cost, as opposed to the worst case warned about
     real = runner.attempts_made()
@@ -1602,11 +1718,24 @@ creds.txt format
                            proto_rank.get(r["protocol"], 99),
                            ip_sort_key(r["ip"]), r["raw"]),
         )
+        # A consumer of this file faces the same ambiguity the matrix does:
+        # a protocol with no rows could be a dead port or a job that was never
+        # run. Name the second case explicitly rather than leaving it as an
+        # absence to be misread.
+        not_run = sorted(
+            ({"user": ck[0], "secret": ck[1], "is_hash": ck[2],
+              "domain": ck[3], "local_auth": ck[4],
+              "protocol": proto, "reason": why}
+             for (ck, proto), why in runner.not_run.items()),
+            key=lambda r: (r["user"], r["secret"], bool(r["local_auth"]),
+                           proto_rank.get(r["protocol"], 99)),
+        )
         write_json_atomic(args.jsonout, {
             "generated": datetime.now().isoformat(timespec="seconds"),
             "targets": args.targets,
             "protocols": protocols,
             "results": results,
+            "not_run": not_run,
         })
         print("[*] json written to " + args.jsonout)
 

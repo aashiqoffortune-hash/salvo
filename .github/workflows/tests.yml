@@ -36,3 +36,47 @@ jobs:
 
       - name: help renders
         run: python salvo.py --help > /dev/null
+
+  package:
+    name: package installs and runs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: build the wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: install it into a clean virtualenv
+        run: |
+          python -m venv /tmp/pkgtest
+          /tmp/pkgtest/bin/pip install dist/*.whl
+
+      # The console script goes through cli(), not main(), so this is also the
+      # check that the interrupt and scope handling reaches the installed
+      # command and not only `python3 salvo.py`.
+      - name: the installed command works
+        run: |
+          /tmp/pkgtest/bin/salvo --version
+          /tmp/pkgtest/bin/salvo --scope > /dev/null
+          /tmp/pkgtest/bin/salvo --selftest
+          /tmp/pkgtest/bin/salvo --help > /dev/null
+
+      - name: the packaged version matches the module
+        run: |
+          expected="salvo $(python -c 'import salvo; print(salvo.__version__)')"
+          actual="$(/tmp/pkgtest/bin/salvo --version)"
+          test "$expected" = "$actual" || {
+            echo "version drift: module says '$expected', package says '$actual'"
+            exit 1
+          }
+
+      - name: it declares no runtime dependencies
+        run: |
+          deps=$(/tmp/pkgtest/bin/pip show salvo-nxc | grep '^Requires:' | cut -d: -f2 | tr -d ' ')
+          test -z "$deps" || { echo "unexpected dependencies: $deps"; exit 1; }

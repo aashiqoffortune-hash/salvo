@@ -57,18 +57,11 @@ def nt(user="Administrator", secret="31d6cfe0d16ae931b73c59d7e0c089c0", **kw):
 # be asserted rather than believed.
 # ---------------------------------------------------------------------------
 
-# flags that would turn salvo from a login scheduler into something else
-EXECUTION_AND_DUMP_FLAGS = {
-    "-x", "-X", "-M", "--module",
-    "--sam", "--lsa", "--ntds", "--dpapi", "--laps",
-    "--shares", "--users", "--groups", "--rid-brute", "--pass-pol",
-    "--kerberoasting", "--asreproast", "--bloodhound",
-    "--put-file", "--get-file", "--exec-method",
-}
-
-# every flag build_cmd is allowed to emit, and whether it consumes the next token
-VALUE_FLAGS = {"-t", "--jitter", "-u", "-p", "-H", "-d"} | set(salvo.TIMEOUT_FLAG.values())
-BARE_FLAGS = {"--no-progress", "--local-auth", "--continue-on-success", "-q"}
+# These are salvo's own lists, not a copy of them. They gate the tool at
+# runtime, so asserting against them here checks the thing that actually runs.
+EXECUTION_AND_DUMP_FLAGS = salvo.NEVER_SENT
+VALUE_FLAGS = salvo.ALLOWED_VALUE_FLAGS
+BARE_FLAGS = salvo.ALLOWED_BARE_FLAGS
 
 
 def cred_matrix():
@@ -113,6 +106,46 @@ class TestAuthenticationOnlyScope(unittest.TestCase):
                         i += 1
                         continue
                     self.fail("{} emitted an unexpected flag {!r}".format(proto, tok))
+
+    def test_the_guard_refuses_every_flag_it_names(self):
+        """The refusal list is enforced, not decorative."""
+        for bad in sorted(salvo.NEVER_SENT):
+            with self.assertRaises(salvo.ScopeViolation):
+                salvo.assert_authentication_only(
+                    ["nxc", "smb", "10.0.0.1", "-u", "a", "-p", "b", bad])
+
+    def test_the_guard_passes_a_real_command(self):
+        runner = salvo.Runner(args_ns(), None)
+        for proto in salvo.ALL_PROTOCOLS:
+            for cred in cred_matrix():
+                cmd = runner.build_cmd(cred, proto, ["10.0.0.1"])
+                self.assertIs(salvo.assert_authentication_only(cmd), cmd)
+
+    def test_a_password_that_looks_like_a_flag_does_not_trip_the_guard(self):
+        """The token after -p is a value, not a flag, however it is spelled."""
+        runner = salvo.Runner(args_ns(), None)
+        cmd = runner.build_cmd(pw(secret="-x whoami"), "smb", ["10.0.0.1"])
+        salvo.assert_authentication_only(cmd)
+
+    def test_nothing_spawns_when_the_guard_trips(self):
+        """The refusal happens before the packet, not after the report."""
+        runner = salvo.Runner(args_ns(), None)
+        spawned = []
+
+        def popen(cmd, **kw):
+            spawned.append(cmd)
+            raise AssertionError("must not spawn")
+
+        real_build = runner.build_cmd
+        runner.build_cmd = lambda c, p, t: real_build(c, p, t) + ["--sam"]
+        real_popen = salvo.subprocess.Popen
+        salvo.subprocess.Popen = popen
+        try:
+            with self.assertRaises(salvo.ScopeViolation):
+                runner.run_one(pw(), "smb", ["10.0.0.1"], "sig")
+        finally:
+            salvo.subprocess.Popen = real_popen
+        self.assertEqual(spawned, [])
 
 
 # ---------------------------------------------------------------------------
@@ -1087,3 +1120,92 @@ class TestDegradedInputs(unittest.TestCase):
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
         self.assertNotIn("BrokenPipeError", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Packaging and installation
+# ---------------------------------------------------------------------------
+
+class TestPackaging(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(ROOT, "pyproject.toml")) as fh:
+            self.toml = fh.read()
+
+    def test_the_distribution_is_not_named_salvo(self):
+        """
+        `salvo` on PyPI is an unrelated HTTP load tester, so `pip install
+        salvo` would install a stranger's package.
+        """
+        self.assertIn('name = "salvo-nxc"', self.toml)
+
+    def test_the_installed_command_is_salvo(self):
+        self.assertIn('salvo = "salvo:cli"', self.toml)
+
+    def test_the_entry_point_exists_and_is_not_main(self):
+        """
+        The console script must go through cli(), or the interrupt, scope and
+        broken-pipe handling would apply only to `python3 salvo.py`.
+        """
+        self.assertTrue(callable(salvo.cli))
+        self.assertIsNot(salvo.cli, salvo.main)
+
+    def test_it_declares_no_dependencies(self):
+        self.assertIn("dependencies = []", self.toml)
+
+    def test_the_version_is_single_sourced(self):
+        self.assertIn('version = { attr = "salvo.__version__" }', self.toml)
+        self.assertIn('dynamic = ["version"]', self.toml)
+
+    def test_the_supported_python_range_matches_ci(self):
+        self.assertIn('requires-python = ">=3.8"', self.toml)
+        with open(os.path.join(ROOT, ".github", "workflows", "tests.yml")) as fh:
+            workflow = fh.read()
+        for version in ("3.8", "3.9", "3.10", "3.11", "3.12", "3.13"):
+            self.assertIn('"{}"'.format(version), workflow)
+
+
+class TestInstallHygiene(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path_backup = os.environ.get("PATH", "")
+
+    def tearDown(self):
+        os.environ["PATH"] = self.path_backup
+        import shutil as _sh
+        _sh.rmtree(self.dir, ignore_errors=True)
+
+    def make_salvo(self, name="salvo"):
+        path = os.path.join(self.dir, name)
+        with open(path, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def test_a_shadowing_copy_is_found(self):
+        stale = self.make_salvo()
+        os.environ["PATH"] = self.dir + os.pathsep + self.path_backup
+        self.assertIn(stale, salvo.other_installs())
+
+    def test_nothing_is_reported_when_the_path_is_clean(self):
+        os.environ["PATH"] = self.dir
+        self.assertEqual(salvo.other_installs(), [])
+
+    def test_the_running_file_is_not_reported_as_a_conflict(self):
+        os.environ["PATH"] = os.path.dirname(os.path.abspath(salvo.__file__))
+        real = os.path.realpath(salvo.__file__)
+        self.assertNotIn(real, [os.path.realpath(p) for p in salvo.other_installs()])
+
+
+class TestScopeCommand(unittest.TestCase):
+    def test_scope_prints_the_lists_that_gate_the_tool(self):
+        r = run_cli("--scope")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        for flag in sorted(salvo.NEVER_SENT):
+            self.assertIn(flag, r.stdout)
+        for flag in sorted(salvo.ALLOWED_BARE_FLAGS):
+            self.assertIn(flag, r.stdout)
+
+    def test_scope_needs_no_targets_and_contacts_nothing(self):
+        r = run_cli("--scope")
+        self.assertNotIn("no targets given", r.stdout + r.stderr)
+        self.assertIn("authentication only", r.stdout)

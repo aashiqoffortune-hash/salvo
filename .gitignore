@@ -7,3 +7,7 @@ creds.txt
 targets.txt
 salvo.json
 nxclogs/
+dist/
+build/
+*.egg-info/
+.venv/

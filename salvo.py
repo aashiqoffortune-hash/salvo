@@ -182,6 +182,67 @@ DEFAULT_PORT = {
 }
 
 # ---------------------------------------------------------------------------
+# Authentication-only enforcement
+#
+# salvo's entire claim - that it is a scheduler for logins and nothing else -
+# rests on what it is willing to put on an nxc command line. A claim in a
+# README is documentation; this is enforcement. Every command is checked
+# against these sets immediately before it spawns, so an edit or a merged
+# patch that reaches for an execution flag aborts the run loudly instead of
+# quietly turning salvo into a different class of tool. See EXAM.md.
+# ---------------------------------------------------------------------------
+
+# flags salvo may emit, and which of them consume the following token.
+# TIMEOUT_FLAG is folded in rather than restated, so a protocol added to that
+# table cannot be permitted here by accident or forbidden here by omission.
+ALLOWED_VALUE_FLAGS = (frozenset(["-t", "--jitter", "-u", "-p", "-H", "-d"])
+                       | frozenset(TIMEOUT_FLAG.values()))
+ALLOWED_BARE_FLAGS = frozenset([
+    "--no-progress", "--local-auth", "--continue-on-success",
+    "-q",   # proxychains' own quiet flag, when wrapping
+])
+
+# Named so the refusal can say what it refused rather than only that it did.
+# Not a filter - the allowlist above is what actually decides - but the list a
+# reader wants to see, and the list the test suite asserts against.
+NEVER_SENT = frozenset([
+    "-x", "-X", "-M", "--module",                      # command execution
+    "--sam", "--lsa", "--ntds", "--dpapi", "--laps",   # credential dumping
+    "--shares", "--users", "--groups", "--rid-brute",  # enumeration beyond auth
+    "--pass-pol", "--kerberoasting", "--asreproast", "--bloodhound",
+    "--put-file", "--get-file", "--exec-method",
+])
+
+
+class ScopeViolation(Exception):
+    """salvo built a command outside its authentication-only remit."""
+
+
+def assert_authentication_only(cmd):
+    """
+    Refuse to run a command carrying any flag outside the allowlist.
+
+    Checked immediately before every spawn. The allowlist is exhaustive on
+    purpose: an unrecognised flag is refused rather than permitted, so the
+    failure mode of a future edit is a loud abort, not a silent change in what
+    the tool does on someone else's estate.
+    """
+    i = 0
+    while i < len(cmd):
+        token = cmd[i]
+        if token in ALLOWED_VALUE_FLAGS:
+            i += 2          # the flag and its value
+            continue
+        if token in ALLOWED_BARE_FLAGS or not token.startswith("-"):
+            i += 1
+            continue
+        raise ScopeViolation(
+            "{!r} is not an authentication flag. salvo logs in and reports; "
+            "it does not execute, dump, or collect.".format(token))
+    return cmd
+
+
+# ---------------------------------------------------------------------------
 # Result statuses
 # ---------------------------------------------------------------------------
 
@@ -738,7 +799,8 @@ class Runner:
             time.sleep(self.args.job_delay)
             if self.abort.is_set():
                 return
-        cmd = self.build_cmd(cred, proto, targets)
+        # Refuse before the packet, not after the report.
+        cmd = assert_authentication_only(self.build_cmd(cred, proto, targets))
         logpath = self.logpath_for(cred, proto)
         job_hits = []
 
@@ -1516,6 +1578,87 @@ def selftest():
     return 0
 
 
+def print_scope():
+    """
+    What salvo is permitted to do, printed from the sets that actually gate it.
+
+    This is not a summary of the code, it IS the code's data - so it cannot
+    drift from behaviour the way a README section can. Useful when someone
+    asks whether the tool is eligible under a given set of rules.
+    """
+    print("\nsalvo {} - authentication only".format(__version__))
+    print("running from: {}\n".format(_running_path()))
+    print("  Every nxc command salvo builds is checked against the lists below")
+    print("  immediately before it is executed. Anything unrecognised aborts")
+    print("  the run rather than being sent.\n")
+    print("  flags salvo may send:")
+    for f in sorted(ALLOWED_VALUE_FLAGS):
+        print("      {} <value>".format(f))
+    for f in sorted(ALLOWED_BARE_FLAGS):
+        print("      {}".format(f))
+    print("\n  flags salvo will never send:")
+    for f in sorted(NEVER_SENT):
+        print("      {}".format(f))
+    print("\n  salvo does not exploit, execute commands, dump credentials,")
+    print("  spoof, poison, relay, or scan for vulnerabilities. It authenticates,")
+    print("  reads the answer, and prints a matrix.")
+    print("\n  Your own exam or engagement rules are the authority, not this")
+    print("  output. Confirm them yourself, and use --dry-run to see exactly")
+    print("  what would be sent before you send it.\n")
+    return 0
+
+
+def _running_path():
+    try:
+        return os.path.realpath(sys.argv[0]) if sys.argv and sys.argv[0] else "?"
+    except OSError:
+        return "?"
+
+
+def other_installs():
+    """
+    Every executable named 'salvo' on PATH that is not the one running.
+
+    salvo used to be installed by hand - `install -m 755 salvo.py ~/bin/salvo`
+    - so a later pip install leaves that copy in place and PATH order silently
+    decides which one runs. Running last month's parser against this month's
+    NetExec produces confident, wrong cells, which is the one failure this
+    tool exists to prevent.
+    """
+    running = _running_path()
+    found, seen = [], set()
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if not directory:
+            continue
+        candidate = os.path.join(directory, "salvo")
+        try:
+            if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
+                continue
+            real = os.path.realpath(candidate)
+        except OSError:
+            continue
+        if real == running or real in seen:
+            continue
+        seen.add(real)
+        found.append(candidate)
+    return found
+
+
+def warn_about_other_installs():
+    others = other_installs()
+    if not others:
+        return
+    sys.stderr.write(
+        "[!] another 'salvo' is installed and PATH order decides which runs:\n")
+    for path in others:
+        sys.stderr.write("      {}\n".format(path))
+    sys.stderr.write(
+        "    this one: {}\n"
+        "    If that is an older hand-installed copy, delete it and reinstall:\n"
+        "        pip install --upgrade --force-reinstall salvo-nxc\n\n"
+        .format(_running_path()))
+
+
 def nxc_version(nxc_bin):
     """
     Which NetExec produced this report. salvo reads nxc's human-readable
@@ -1716,6 +1859,9 @@ creds.txt format
     g.add_argument("--no-lockout-guard", action="store_true",
                    help="do NOT abort the run when a lockout is seen")
     g.add_argument("--nxc-bin", default="nxc", help="path to nxc (default: nxc on PATH)")
+    g.add_argument("--scope", action="store_true",
+                   help="print exactly which nxc flags salvo may and may not send, "
+                        "from the lists that gate it at runtime, and exit")
     g.add_argument("--selftest", action="store_true",
                    help="run the output parser against known nxc line formats and exit")
     g.add_argument("--check-nxc", action="store_true",
@@ -1733,6 +1879,11 @@ creds.txt format
                    help="delete the --state file and exit")
 
     args = ap.parse_args()
+
+    if args.scope:
+        sys.exit(print_scope())
+
+    warn_about_other_installs()
 
     if args.selftest:
         print("\n[*] salvo parser self-test\n")
@@ -1946,7 +2097,8 @@ creds.txt format
         print("\n[commands that would run - {} of them{}]\n".format(
             len(jobs), ", {} skipped".format(runner.skipped) if runner.skipped else ""))
         for cred, proto, tgts, _sig in jobs:
-            print("  " + " ".join(quote(c) for c in runner.build_cmd(cred, proto, tgts)))
+            cmd = assert_authentication_only(runner.build_cmd(cred, proto, tgts))
+            print("  " + " ".join(quote(c) for c in cmd))
         print("")
         return
 
@@ -2097,11 +2249,21 @@ creds.txt format
         print("[*] resume state: {} ({} job(s) recorded)".format(args.state, len(state.jobs)))
 
 
-if __name__ == "__main__":
+def cli():
+    """
+    Console-script entry point.
+
+    The installed `salvo` command calls this, not main(), so the interrupt,
+    scope and broken-pipe handling below applies to it exactly as it does to
+    `python3 salvo.py`.
+    """
     try:
         main()
     except KeyboardInterrupt:
         sys.exit("\n[!] interrupted")
+    except ScopeViolation as exc:
+        sys.exit("\n[!] REFUSING TO RUN - {}\n    This is salvo's "
+                 "authentication-only guard. Nothing was sent.\n".format(exc))
     except BrokenPipeError:
         # Piped into head, less, or a pager the operator quit. Python flushes
         # stdout again on the way out, which would raise a second time and
@@ -2113,3 +2275,7 @@ if __name__ == "__main__":
         except OSError:
             pass
         sys.exit(0)
+
+
+if __name__ == "__main__":
+    cli()

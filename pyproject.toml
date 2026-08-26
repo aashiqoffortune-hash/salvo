@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# `salvo` is taken on PyPI by an unrelated HTTP load tester, so the
+# distribution is salvo-nxc. The installed command is still `salvo`.
+name = "salvo-nxc"
+dynamic = ["version"]
+description = "One credential, every NetExec protocol, one honest matrix."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [{ name = "Aashiq Shaikh" }]
+keywords = [
+    "netexec", "nxc", "penetration-testing", "active-directory",
+    "credential-validation", "password-spraying", "oscp", "red-team",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+]
+# Deliberately empty, and a test asserts it stays that way. salvo is stdlib
+# only; NetExec is a runtime prerequisite, not a Python dependency, because
+# nxc is invoked as a subprocess and is usually installed with pipx.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/aashiqoffortune-hash/salvo"
+Source = "https://github.com/aashiqoffortune-hash/salvo"
+Issues = "https://github.com/aashiqoffortune-hash/salvo/issues"
+
+[project.scripts]
+salvo = "salvo:cli"
+
+[tool.setuptools]
+py-modules = ["salvo"]
+
+[tool.setuptools.dynamic]
+version = { attr = "salvo.__version__" }

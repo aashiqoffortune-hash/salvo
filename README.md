@@ -99,13 +99,47 @@ not left to infer it from an absence.
 ## Install
 
 ```bash
-git clone https://github.com/aashiqoffortune-hash/salvo.git
-cd salvo
-install -m 755 salvo.py ~/bin/salvo   # or anywhere on PATH
+pipx install salvo-nxc     # or: pip install --user salvo-nxc
 salvo --help
 ```
 
-Requires Python 3.8+ and [NetExec](https://github.com/Pennyw0rth/NetExec) on `PATH`.
+> **The package is `salvo-nxc`, not `salvo`.** `salvo` on PyPI is an unrelated
+> HTTP load tester by another author. `pip install salvo` gets you that, not
+> this. The installed **command** is still `salvo`.
+
+Requires Python 3.8+ and [NetExec](https://github.com/Pennyw0rth/NetExec) on
+`PATH`. salvo itself has no Python dependencies — stdlib only, and a test
+asserts it stays that way.
+
+### Upgrading
+
+```bash
+pipx upgrade salvo-nxc     # or: pip install --upgrade salvo-nxc
+```
+
+If you installed an earlier salvo by hand — the old instructions said
+`install -m 755 salvo.py ~/bin/salvo` — that copy is still there after an
+upgrade, and PATH order decides which one runs. salvo checks for this on every
+run and tells you:
+
+```
+[!] another 'salvo' is installed and PATH order decides which runs:
+      /home/kali/bin/salvo
+    this one: /home/kali/.local/bin/salvo
+    If that is an older hand-installed copy, delete it and reinstall:
+        pip install --upgrade --force-reinstall salvo-nxc
+```
+
+Running last month's parser against this month's NetExec produces confident,
+wrong cells, which is the one failure this tool exists to prevent.
+
+### From a clone
+
+```bash
+git clone https://github.com/aashiqoffortune-hash/salvo.git
+cd salvo
+python3 salvo.py --help    # runs as-is, no install step
+```
 
 ---
 
@@ -241,9 +275,27 @@ If any host returns `STATUS_ACCOUNT_LOCKED_OUT` mid-run, every remaining process
 
 ## Authentication only
 
-`salvo` never passes `-x`, `-X`, `-M`, `--sam`, `--lsa`, `--ntds` or any other execution or dumping flag to `nxc`. It logs in, reports, and stops. It is a scheduler for a tool you would otherwise run by hand, eight times.
+`salvo` never passes `-x`, `-X`, `-M`, `--sam`, `--lsa`, `--ntds` or any other
+execution, dumping or collection flag to `nxc`. It logs in, reports, and stops.
+It is a scheduler for a tool you would otherwise run by hand, eight times.
 
-If you are operating under rules that restrict tooling, confirm those rules yourself. That design intent is a reading, not a ruling.
+This is **enforced, not promised**. Every command is checked against an
+exhaustive allowlist immediately before it spawns, and an unrecognised flag
+aborts the run rather than being sent:
+
+```bash
+salvo --scope      # the lists that gate it, printed from the code that gates it
+salvo --dry-run    # every command it would run, running nothing
+```
+
+The test suite asserts it across every protocol and every credential shape on
+every commit, so a patch that reaches for an execution flag fails CI rather
+than quietly changing what the tool is.
+
+**Working under restricted-tooling rules?** [EXAM.md](EXAM.md) maps salvo
+against OffSec's published OSCP/OSCP+ restrictions point by point, with
+sources. Confirm the current guide yourself — it is the authority, and it
+changes.
 
 ---
 
@@ -275,6 +327,7 @@ If you are operating under rules that restrict tooling, confirm those rules your
 | `--forget` | off | delete the state file and exit |
 | `--no-lockout-guard` | off | do not abort on lockout |
 | `--nxc-bin` | `nxc` | path to `nxc` |
+| `--scope` | — | print the flags salvo may and may not send, and exit |
 | `--version` | — | print the salvo version and exit |
 
 ---
@@ -295,17 +348,18 @@ fresh clone:
 python3 -m unittest discover -s tests -v
 ```
 
-107 tests covering the verdict table, the `nxc` command builder, planning and
+122 tests covering the verdict table, the `nxc` command builder, planning and
 resume, matrix rendering and its determinism, credential parsing, host
-counting, process hygiene, degraded state files, and file permissions. Three
-are worth naming:
+counting, process hygiene, degraded state files, packaging, install hygiene,
+and file permissions. Three are worth naming:
 
 - **the scope invariant** — every credential shape against every protocol, then
   assert that no execution or dumping flag (`-x`, `-X`, `-M`, `--sam`, `--lsa`,
   `--ntds`, …) ever appears in a built command line, and that every flag salvo
-  *does* emit is on an explicit allowlist. The authentication-only design rule is
-  asserted, not just documented, and a flag added later fails the suite until
-  someone consciously allows it.
+  *does* emit is on an explicit allowlist. The tests read salvo's own lists
+  rather than a copy of them, so they check the thing that actually gates the
+  tool at runtime. A flag added later fails the suite until someone
+  consciously allows it.
 - **the parser corpus** — the `--selftest` line formats, asserted rather than
   printed, so a NetExec output change breaks CI instead of a live run.
 - **end to end against a fake nxc** — `tests/fake_nxc.py` emits real nxc line

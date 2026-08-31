@@ -153,6 +153,58 @@ class TestAuthenticationOnlyScope(unittest.TestCase):
 # Command construction
 # ---------------------------------------------------------------------------
 
+class TestDashPrefixedCredentials(unittest.TestCase):
+    """
+    A credential field beginning with '-' lands on the command line in the
+    position the allowlist walk steps over as some flag's value. '-u --ntds'
+    put --ntds on an nxc command line and the walk skipped straight past it,
+    so the one property this tool actually promises - that a dumping flag is
+    never on the line - was false for any creds file containing such a name.
+    """
+
+    def build(self, **kw):
+        cred = salvo.Cred(kw.pop("user", "jdoe"), kw.pop("secret", "pw"),
+                          False, **kw)
+        r = salvo.Runner.__new__(salvo.Runner)
+        r.args = args_ns()
+        r.domain_dropped = set()
+        return r.build_cmd(cred, "smb", ["10.0.0.1"])
+
+    def test_a_forbidden_flag_as_a_username_is_refused(self):
+        for flag in ("--ntds", "--sam", "--lsa", "-x", "--shares"):
+            cmd = self.build(user=flag)
+            self.assertIn(flag, cmd, "precondition: it really is on the line")
+            with self.assertRaises(salvo.ScopeViolation, msg=flag):
+                salvo.assert_authentication_only(cmd)
+
+    def test_a_forbidden_flag_as_a_secret_or_domain_is_refused(self):
+        with self.assertRaises(salvo.ScopeViolation):
+            salvo.assert_authentication_only(self.build(secret="--ntds"))
+        with self.assertRaises(salvo.ScopeViolation):
+            salvo.assert_authentication_only(self.build(domain="--lsa"))
+
+    def test_ordinary_credentials_are_still_allowed(self):
+        """The guard must not have become a blanket refusal."""
+        for kw in ({}, {"domain": "corp.local"}, {"secret": "P-a-s-s!"},
+                   {"user": "svc-sql"}):
+            salvo.assert_authentication_only(self.build(**kw))
+
+    def test_the_run_refuses_before_spending_a_logon(self):
+        """Caught at parse time it costs nothing; caught at spawn it costs a job."""
+        d = tempfile.mkdtemp()
+        try:
+            path = os.path.join(d, "creds.txt")
+            with open(path, "w") as fh:
+                fh.write("--ntds:password123\n")
+            r = run_cli("10.0.0.1", "-C", path, "--nxc-bin",
+                        os.path.join(ROOT, "tests", "fake_nxc.py"), "--dry-run")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("starts with '-'", r.stdout + r.stderr)
+        finally:
+            import shutil as _sh
+            _sh.rmtree(d, ignore_errors=True)
+
+
 class TestBuildCmd(unittest.TestCase):
     def setUp(self):
         self.runner = salvo.Runner(args_ns(), None)
@@ -571,6 +623,37 @@ class TestFilePermissions(unittest.TestCase):
 
     def mode(self, path):
         return stat.S_IMODE(os.stat(path).st_mode)
+
+    def test_a_planted_symlink_is_not_written_through(self):
+        """
+        Every path salvo writes is predictable, so on a shared box someone can
+        create the file first as a link to something else. Following it would
+        truncate that target and chmod it 0600 for good measure.
+        """
+        victim = os.path.join(self.dir, "victim")
+        with open(victim, "w") as fh:
+            fh.write("do not clobber")
+        link = os.path.join(self.dir, "salvo.json")
+        os.symlink(victim, link)
+        with self.assertRaises(OSError):
+            salvo.open_private(link)
+        with open(victim) as fh:
+            self.assertEqual(fh.read(), "do not clobber")
+
+    def test_a_symlinked_output_path_is_refused_before_the_run(self):
+        """
+        open_private would refuse it anyway, but that refusal lands after the
+        spray. For --state, after the spray is the one moment the file matters.
+        """
+        real = os.path.join(self.dir, "real.json")
+        with open(real, "w") as fh:
+            fh.write("x")
+        link = os.path.join(self.dir, "link.json")
+        os.symlink(real, link)
+        r = run_cli("10.0.0.1", "-u", "jdoe", "-p", "pw", "--json", link,
+                    "--nxc-bin", os.path.join(ROOT, "tests", "fake_nxc.py"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("is a symlink", r.stdout + r.stderr)
 
     def test_state_and_json_are_owner_only(self):
         path = os.path.join(self.dir, "out.json")
@@ -1239,9 +1322,13 @@ class TestReadmeClaims(unittest.TestCase):
     def test_the_stated_test_count_is_the_real_one(self):
         here = os.path.dirname(os.path.abspath(__file__))
         actual = unittest.TestLoader().discover(here).countTestCases()
-        self.assertIn("{} tests covering".format(actual), self.readme,
-                      "the README states a test count that is no longer true - "
-                      "the suite now has {}".format(actual))
+        stated = re.search(r"(\d+) tests covering", self.readme)
+        self.assertIsNotNone(stated, "the README no longer states a test count")
+        # assertIn would print the whole README on failure; the two numbers are
+        # the only part anyone needs to read.
+        self.assertEqual(int(stated.group(1)), actual,
+                         "the README says {} tests, the suite has {}".format(
+                             stated.group(1), actual))
 
 
 class TestInstallHygiene(unittest.TestCase):

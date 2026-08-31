@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 392" width="880" height="392" role="img"
+     aria-label="Every salvo cell is one of three claims: about the credential, about the host, or about salvo itself.">
+  <title>salvo's verdict taxonomy</title>
+
+  <style>
+    .bg    { fill: #FBFAF7; stroke: #E2DDD3; stroke-width: 1.5; }
+    .panel { fill: #FFFFFF; stroke: #E2DDD3; stroke-width: 1.5; }
+    .h1    { font: 600 21px ui-sans-serif, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1C1A17; }
+    .sub   { font: 400 13.5px ui-sans-serif, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #6B655B; }
+    .hdr   { font: 600 11.5px ui-sans-serif, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+             fill: #6B655B; letter-spacing: 1.1px; }
+    .g     { font: 700 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .d     { font: 400 12.5px ui-sans-serif, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #4A453D; }
+    .foot  { font: 400 13px ui-sans-serif, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1C1A17; }
+    .fmono { font: 700 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #A33A3A; }
+    .rule  { stroke: #E2DDD3; stroke-width: 1.5; }
+  </style>
+
+  <rect class="bg" x="1" y="1" width="878" height="390" rx="10"/>
+
+  <text class="h1" x="32" y="44">Every cell is one of three claims</text>
+  <text class="sub" x="32" y="66">Most tooling has two buckets. Collapsing the rest into &#8220;failed&#8221; is how a live credential gets thrown away.</text>
+
+  <!-- ============ panel 1: the credential ============ -->
+  <rect class="panel" x="32" y="90" width="380" height="250" rx="8"/>
+  <text class="hdr" x="52" y="116">ABOUT THE CREDENTIAL</text>
+  <line class="rule" x1="52" y1="128" x2="392" y2="128"/>
+
+  <text class="g" x="52" y="156" fill="#1F7A4D">ADMIN</text>
+  <text class="d" x="132" y="156">provably administrative</text>
+
+  <text class="g" x="52" y="182" fill="#1F7A4D">exec</text>
+  <text class="d" x="132" y="182">execution &#8212; <tspan font-weight="600">not</tspan> admin</text>
+
+  <text class="g" x="52" y="208" fill="#1F7A4D">ok</text>
+  <text class="d" x="132" y="208">authenticated</text>
+
+  <text class="g" x="52" y="240" fill="#B26B00">VALID*</text>
+  <text class="d" x="132" y="240">password <tspan font-weight="600">correct</tspan>, this path closed</text>
+
+  <text class="g" x="52" y="266" fill="#40566B">?</text>
+  <text class="d" x="132" y="266">cannot tell &#8212; still live, retest</text>
+
+  <text class="g" x="52" y="292" fill="#6B655B" font-size="20">.</text>
+  <text class="d" x="132" y="292">confirmed wrong</text>
+
+  <text class="sub" x="52" y="316" font-size="12">Neither middle glyph is a dead<tspan x="52" dy="15">credential. That is the point.</tspan></text>
+
+  <!-- ============ panel 2: the host ============ -->
+  <rect class="panel" x="432" y="90" width="180" height="250" rx="8"/>
+  <text class="hdr" x="452" y="116">ABOUT THE HOST</text>
+  <line class="rule" x1="452" y1="128" x2="592" y2="128"/>
+
+  <text class="g" x="452" y="158" fill="#3A352E" font-size="22">-</text>
+  <text class="d" x="452" y="182">no service,</text>
+  <text class="d" x="452" y="200">or no answer</text>
+
+  <text class="sub" x="452" y="322" font-size="12">The only glyph that<tspan x="452" dy="15">describes the target.</tspan></text>
+
+  <!-- ============ panel 3: salvo ============ -->
+  <rect class="panel" x="632" y="90" width="216" height="250" rx="8"/>
+  <text class="hdr" x="652" y="116">ABOUT SALVO</text>
+  <line class="rule" x1="652" y1="128" x2="828" y2="128"/>
+
+  <text class="g" x="652" y="156" fill="#A33A3A">n/a</text>
+  <text class="d" x="652" y="176">no job was ever run</text>
+
+  <text class="g" x="652" y="212" fill="#A33A3A">!CMD</text>
+  <text class="d" x="652" y="232">nxc rejected the command</text>
+
+  <text class="g" x="652" y="268" fill="#A33A3A">err</text>
+  <text class="d" x="652" y="288">salvo could not run it</text>
+
+  <text class="sub" x="652" y="322" font-size="12">Not verdicts. Each one<tspan x="652" dy="15">prints its reason.</tspan></text>
+
+  <text class="foot" x="32" y="368">An empty cell renders <tspan class="fmono">-</tspan>. That is why the four glyphs which are <tspan font-style="italic">not</tspan> about the host are never left empty.</text>
+</svg>

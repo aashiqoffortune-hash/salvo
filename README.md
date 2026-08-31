@@ -96,6 +96,8 @@ could not run at all — and each prints its reason under the table. `--json`
 carries the same distinction in a `not_run` array, so a consumer of the file is
 not left to infer it from an absence.
 
+![Every salvo cell is one of three claims: about the credential, about the host, or about salvo itself](sketch-verdicts.svg)
+
 ---
 
 ## Install
@@ -298,7 +300,10 @@ It is a scheduler for a tool you would otherwise run by hand, eight times.
 
 This is **enforced, not promised**. Every command is checked against an
 exhaustive allowlist immediately before it spawns, and an unrecognised flag
-aborts the run rather than being sent:
+aborts the run rather than being sent. The check reads the *whole* line, not
+only the positions it expects flags in — a username or password beginning with
+`-` lands where a flag's value goes, and that is exactly where a forbidden one
+would otherwise ride along unseen:
 
 ```bash
 salvo --scope      # the lists that gate it, printed from the code that gates it
@@ -371,7 +376,7 @@ fresh clone:
 python3 -m unittest discover -s tests -v
 ```
 
-138 tests covering the verdict table, the `nxc` command builder, planning and
+144 tests covering the verdict table, the `nxc` command builder, planning and
 resume, matrix rendering and its determinism, credential parsing, host
 counting, process hygiene, degraded state files, packaging, install hygiene,
 file permissions, and the README's own claims about all of it. Three are worth
@@ -487,6 +492,16 @@ serialise the secret directly, and every `nxc` log line echoes the password back
 All three are created **`0600`**, and a `--logdir` that salvo creates is `0700`.
 A log directory you already had is left alone — salvo says so rather than
 changing the permissions of something outside its scope.
+
+Every one of those paths is predictable, so salvo **refuses to write through a
+symlink**. On a shared box, anyone who can create `salvo.json` in your working
+directory first can otherwise point it somewhere else and have salvo truncate
+that file instead.
+
+One thing salvo cannot fix: `nxc` takes the secret on its command line, so for
+the life of each process the password is visible in `ps` to any local account.
+That is inherent to wrapping `nxc` and is worth knowing before you run this on
+a box you share.
 
 ## Operational security
 

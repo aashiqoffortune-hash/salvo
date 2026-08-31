@@ -23,6 +23,7 @@ Stdlib only - no pip, no virtualenv, no dependencies beyond nxc itself.
 """
 
 import argparse
+import errno
 import hashlib
 import ipaddress
 import json
@@ -90,13 +91,37 @@ def ensure_writable(path, what):
         sys.exit("[!] {} directory does not exist: {}".format(what, directory))
     if not os.access(directory, os.W_OK):
         sys.exit("[!] {} directory is not writable: {}".format(what, directory))
+    if os.path.islink(path):
+        # open_private refuses to follow it anyway, but that refusal would land
+        # after the run rather than before it - and for --state, after the run
+        # is the one moment the file is worth having.
+        sys.exit("[!] {} is a symlink: {}\n    salvo will not write through a "
+                 "symlink. Point it at a real path.".format(what, path))
     if os.path.exists(path) and not os.access(path, os.W_OK):
         sys.exit("[!] {} is not writable: {}".format(what, path))
 
 
 def open_private(path):
-    """open(path, 'w') that never widens past owner read/write."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
+    """
+    open(path, 'w') that never widens past owner read/write, and never follows
+    a symlink.
+
+    O_NOFOLLOW is the half that matters on a shared box. Every path salvo
+    writes is predictable - `salvo.json`, a state file, a log name built from
+    the protocol and username - so anyone who can create a file in the
+    directory first can point it at something else and have salvo truncate
+    that instead, then chmod the target to 0600 for good measure. Refusing to
+    follow the link costs nothing: a symlink is never what the operator meant
+    by an output path.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, PRIVATE_FILE_MODE)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            raise OSError(exc.errno,
+                          "{} is a symlink; refusing to write through it".format(path))
+        raise
     try:
         os.fchmod(fd, PRIVATE_FILE_MODE)   # a pre-existing file keeps its old mode otherwise
     except OSError:
@@ -227,6 +252,20 @@ def assert_authentication_only(cmd):
     failure mode of a future edit is a loud abort, not a silent change in what
     the tool does on someone else's estate.
     """
+    # A forbidden flag must not appear ANYWHERE on the line - including in a
+    # position the allowlist walk below steps over as some flag's value. A
+    # username, password or domain beginning with '-' lands in exactly such a
+    # position: '-u --ntds' put --ntds on the command line and the walk skipped
+    # it as the value of -u. What nxc's parser then does with that token is
+    # nxc's business, and salvo is in no position to promise what it will be.
+    for token in cmd:
+        if token in NEVER_SENT:
+            raise ScopeViolation(
+                "{!r} must never reach an nxc command line, and it is on this "
+                "one - most likely as a username, password or domain beginning "
+                "with '-'. salvo logs in and reports; it does not execute, "
+                "dump, or collect.".format(token))
+
     i = 0
     while i < len(cmd):
         token = cmd[i]
@@ -2052,6 +2091,21 @@ def main():
             sys.exit("[!] -u needs -p or -H")
     if not raw_creds:
         sys.exit("[!] no credentials given. Use -u/-p, -u/-H, or -C.")
+
+    # A credential field starting with '-' cannot reach nxc as a value: its
+    # parser reads the leading dash and takes the token as a flag. Caught here
+    # it costs nothing; caught at spawn time it is an aborted job per protocol,
+    # and if the field happens to spell a dumping flag it is the scope guard
+    # that stops the run. Say it once, before the first logon.
+    for dom, user, secret, _is_hash in raw_creds:
+        for what, value in (("username", user), ("secret", secret), ("domain", dom)):
+            if value and value.startswith("-"):
+                sys.exit("[!] {} {!r} starts with '-'. nxc's parser reads that as "
+                         "a flag, not a value, so this credential can never be "
+                         "tested as written.".format(what, value))
+    if args.domain and args.domain.startswith("-"):
+        sys.exit("[!] domain {!r} starts with '-'. nxc's parser reads that as a "
+                 "flag, not a value.".format(args.domain))
 
     creds = []
     seen_creds = set()

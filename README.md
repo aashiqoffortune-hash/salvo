@@ -325,7 +325,11 @@ changes.
 | `--nxc-threads` | 25 | `nxc`'s own `-t` per process |
 | `--nxc-timeout` | 15 | seconds for nxc's per-protocol timeout flag |
 | `--jitter` | — | `nxc --jitter` value |
+| `--job-delay` | 0 | seconds to wait before each `nxc` process starts — `--jitter` only spaces attempts *inside* one process |
 | `--slow` | off | tunnel preset: 3 / 5 / 30 |
+| `--stealth` | off | low and slow: 1 process, 1 thread, `--jitter 3-7`, 5s between jobs, timeout 30 |
+| `--proxychains` | off | run every `nxc` under proxychains — for chisel / `ssh -D`, not needed with ligolo-ng |
+| `--proxychains-bin` | `proxychains4` | proxychains binary |
 | `--markdown` | off | matrix as a Markdown table |
 | `--json` | — | write all results as JSON |
 | `--logdir` | — | raw `nxc` output, one file per job |
@@ -337,6 +341,8 @@ changes.
 | `--no-lockout-guard` | off | do not abort on lockout |
 | `--nxc-bin` | `nxc` | path to `nxc` |
 | `--scope` | — | print the flags salvo may and may not send, and exit |
+| `--selftest` | — | run the output parser against known `nxc` line formats, and exit |
+| `--check-nxc` | — | compare salvo's capability tables against the installed `nxc`, and exit |
 | `--version` | — | print the salvo version and exit |
 
 ---
@@ -357,7 +363,7 @@ fresh clone:
 python3 -m unittest discover -s tests -v
 ```
 
-122 tests covering the verdict table, the `nxc` command builder, planning and
+137 tests covering the verdict table, the `nxc` command builder, planning and
 resume, matrix rendering and its determinism, credential parsing, host
 counting, process hygiene, degraded state files, packaging, install hygiene,
 and file permissions. Three are worth naming:
@@ -378,7 +384,7 @@ and file permissions. Three are worth naming:
   further logons, and a command nxc rejects being marked `!CMD` and left
   unrecorded so the next run retries it.
 
-CI runs the suite plus `--selftest` on Python 3.8 through 3.13.
+CI runs the suite plus `--selftest` on Python 3.8 through 3.14.
 
 ## Releasing
 

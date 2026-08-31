@@ -12,6 +12,7 @@ pytest collects unittest.TestCase classes too, if you happen to have it.
 import io
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -1162,6 +1163,73 @@ class TestPackaging(unittest.TestCase):
             workflow = fh.read()
         for version in ("3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"):
             self.assertIn('"{}"'.format(version), workflow)
+
+
+class TestDocumentedOptions(unittest.TestCase):
+    """
+    The README's options table is a hand-maintained second copy of the parser,
+    and a second copy drifts. `--stealth`, `--job-delay`, `--proxychains`,
+    `--proxychains-bin`, `--selftest` and `--check-nxc` all shipped while the
+    table that claims to list the options did not mention them - so a reader
+    scanning it for a way to slow the tool down on a monitored network would
+    conclude there wasn't one. These read the parser that actually runs, not a
+    transcript of its --help, so line wrapping cannot hide a flag either way.
+    """
+
+    def setUp(self):
+        with open(os.path.join(ROOT, "README.md")) as fh:
+            readme = fh.read()
+        start = readme.index("\n## Options\n")
+        self.table = readme[start:readme.index("\n## ", start + 1)]
+
+    def parser_flags(self):
+        flags = set()
+        for action in salvo.build_parser()._actions:
+            flags.update(o for o in action.option_strings if o.startswith("--"))
+        flags.discard("--help")   # argparse's own, not salvo's
+        return flags
+
+    def test_every_flag_the_parser_defines_is_in_the_options_table(self):
+        missing = sorted(f for f in self.parser_flags()
+                         if "`{}`".format(f) not in self.table)
+        self.assertEqual(missing, [], "salvo accepts these flags and the README "
+                                      "options table does not list them: " + ", ".join(missing))
+
+    def test_the_options_table_invents_no_flag_that_does_not_exist(self):
+        """
+        The other direction. A documented flag that argparse rejects is worse
+        than an undocumented one: it fails at the start of a run, after the
+        operator has already committed to the command.
+        """
+        documented = set(re.findall(r"`(--[a-z][a-z0-9-]*)`", self.table))
+        unknown = sorted(documented - self.parser_flags())
+        self.assertEqual(unknown, [], "the README options table documents flags "
+                                      "salvo does not define: " + ", ".join(unknown))
+
+
+class TestReadmeClaims(unittest.TestCase):
+    """
+    Two numbers the README states outright. Both had already drifted from the
+    thing they describe, and a stale number in the one file a reader trusts
+    first is a small lie that costs the rest of the page its credit.
+    """
+
+    def setUp(self):
+        with open(os.path.join(ROOT, "README.md")) as fh:
+            self.readme = fh.read()
+
+    def test_the_python_range_is_the_one_ci_actually_runs(self):
+        with open(os.path.join(ROOT, ".github", "workflows", "tests.yml")) as fh:
+            workflow = fh.read()
+        minors = sorted(int(v.split(".")[1]) for v in re.findall(r'"(3\.\d+)"', workflow))
+        self.assertIn("Python 3.{} through 3.{}".format(minors[0], minors[-1]), self.readme)
+
+    def test_the_stated_test_count_is_the_real_one(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        actual = unittest.TestLoader().discover(here).countTestCases()
+        self.assertIn("{} tests covering".format(actual), self.readme,
+                      "the README states a test count that is no longer true - "
+                      "the suite now has {}".format(actual))
 
 
 class TestInstallHygiene(unittest.TestCase):

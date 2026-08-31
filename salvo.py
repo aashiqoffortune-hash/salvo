@@ -39,7 +39,7 @@ from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 STATE_VERSION = 1
 

@@ -376,7 +376,7 @@ fresh clone:
 python3 -m unittest discover -s tests -v
 ```
 
-145 tests covering the verdict table, the `nxc` command builder, planning and
+146 tests covering the verdict table, the `nxc` command builder, planning and
 resume, matrix rendering and its determinism, credential parsing, host
 counting, process hygiene, degraded state files, packaging, install hygiene,
 file permissions, and the README's own claims about all of it. Three are worth

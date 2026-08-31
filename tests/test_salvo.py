@@ -1210,6 +1210,36 @@ class TestDegradedInputs(unittest.TestCase):
 # Packaging and installation
 # ---------------------------------------------------------------------------
 
+class TestStateFileIsNotAnObject(unittest.TestCase):
+    """
+    json.load returns whatever the file holds - a list, a string, a number.
+    Every branch of load() assumes a mapping, so a state file corrupted to
+    valid-but-wrong JSON crashed the run with an AttributeError before the
+    first logon. A resume store exists to survive a crash; taking the run
+    down itself is the one thing it must not do.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil as _sh
+        _sh.rmtree(self.dir, ignore_errors=True)
+
+    def test_valid_json_that_is_not_an_object_starts_fresh(self):
+        for blob in ("[]", "null", '"a string"', "42", "true"):
+            path = os.path.join(self.dir, "s.json")
+            with open(path, "w") as fh:
+                fh.write(blob)
+            err = io.StringIO()
+            real, sys.stderr = sys.stderr, err
+            try:
+                self.assertEqual(salvo.State(path).load(), 0, blob)
+            finally:
+                sys.stderr = real
+            self.assertIn("not a JSON object", err.getvalue())
+
+
 class TestPackaging(unittest.TestCase):
     def setUp(self):
         with open(os.path.join(ROOT, "pyproject.toml")) as fh:

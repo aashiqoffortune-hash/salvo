@@ -620,6 +620,15 @@ class State:
         except (ValueError, OSError) as exc:
             sys.stderr.write("[!] state file unreadable ({}), starting fresh\n".format(exc))
             return 0
+        if not isinstance(data, dict):
+            # json.load happily returns a list, a string or a number. Every
+            # branch below assumes a mapping, so without this a state file
+            # holding valid-but-wrong JSON takes the run down with an
+            # AttributeError before the first logon - the one failure a resume
+            # store must never cause, since its whole job is to survive a
+            # crash.
+            sys.stderr.write("[!] state file is not a JSON object, starting fresh\n")
+            return 0
         if data.get("version") != STATE_VERSION:
             sys.stderr.write("[!] state file is version {}, expected {} - starting fresh\n"
                              .format(data.get("version"), STATE_VERSION))

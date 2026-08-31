@@ -73,10 +73,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "salvo ${GITHUB_REF_NAME#v}" \
-            --generate-notes
+          # A tag reaches this workflow two ways. Pushed from a clone, no
+          # release exists yet and this creates one. Created through the
+          # Releases UI - the only route open to someone without git push
+          # credentials on the machine they are at - GitHub has already
+          # published the release by the time this runs, and `gh release
+          # create` fails outright on it. Attach the artifacts to what is
+          # there instead, so the same workflow serves both routes.
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists - attaching artifacts to it"
+            gh release upload "$GITHUB_REF_NAME" dist/* \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "salvo ${GITHUB_REF_NAME#v}" \
+              --generate-notes
+          fi
 
   pypi:
     name: publish to PyPI

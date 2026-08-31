@@ -1397,6 +1397,16 @@ class TestReleaseWorkflow(unittest.TestCase):
         self.assertNotIn("PYPI_API_TOKEN", self.workflow)
         self.assertNotIn("password:", self.workflow)
 
+    def test_a_release_created_in_the_ui_does_not_fail_the_job(self):
+        """
+        Someone without git push credentials on the machine they are at can
+        only tag through the Releases UI, which publishes the release before
+        this workflow runs. `gh release create` errors on an existing release,
+        so that route would leave a red job on every release it produced.
+        """
+        self.assertIn("gh release view", self.workflow)
+        self.assertIn("gh release upload", self.workflow)
+
     def test_it_publishes_under_the_right_distribution_name(self):
         self.assertIn("salvo-nxc", self.workflow)
 

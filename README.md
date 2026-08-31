@@ -1,6 +1,8 @@
 # salvo
 
 [![tests](https://github.com/aashiqoffortune-hash/salvo/actions/workflows/tests.yml/badge.svg)](https://github.com/aashiqoffortune-hash/salvo/actions/workflows/tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/salvo-nxc)](https://pypi.org/project/salvo-nxc/)
+[![Python](https://img.shields.io/pypi/pyversions/salvo-nxc)](https://pypi.org/project/salvo-nxc/)
 
 Spray one or many credentials across **every NetExec protocol at once** and read the result as a matrix.
 
@@ -99,21 +101,26 @@ not left to infer it from an absence.
 ## Install
 
 ```bash
-pipx install git+https://github.com/aashiqoffortune-hash/salvo.git
+pipx install salvo-nxc
 salvo --help
 ```
 
 or with pip:
 
 ```bash
-pip install --user git+https://github.com/aashiqoffortune-hash/salvo.git
+pip install --user salvo-nxc
 ```
-
-Once the package is published to PyPI, `pipx install salvo-nxc` works too.
 
 > **The package is `salvo-nxc`, not `salvo`.** `salvo` on PyPI is an unrelated
 > HTTP load tester by another author, so `pip install salvo` gets you that, not
 > this. The installed **command** is still `salvo`.
+
+To run a change that has not been released yet, install from the repository
+instead:
+
+```bash
+pipx install git+https://github.com/aashiqoffortune-hash/salvo.git
+```
 
 Requires Python 3.8+ and [NetExec](https://github.com/Pennyw0rth/NetExec) on
 `PATH`. salvo itself has no Python dependencies — stdlib only, and a test
@@ -122,10 +129,11 @@ asserts it stays that way.
 ### Upgrading
 
 ```bash
-pipx install --force git+https://github.com/aashiqoffortune-hash/salvo.git
+pipx upgrade salvo-nxc
 ```
 
-or, from PyPI once published, `pipx upgrade salvo-nxc`.
+or, for a checkout installed from git, `pipx install --force
+git+https://github.com/aashiqoffortune-hash/salvo.git`.
 
 If you installed an earlier salvo by hand — the old instructions said
 `install -m 755 salvo.py ~/bin/salvo` — that copy is still there after an
@@ -363,10 +371,11 @@ fresh clone:
 python3 -m unittest discover -s tests -v
 ```
 
-137 tests covering the verdict table, the `nxc` command builder, planning and
+138 tests covering the verdict table, the `nxc` command builder, planning and
 resume, matrix rendering and its determinism, credential parsing, host
 counting, process hygiene, degraded state files, packaging, install hygiene,
-and file permissions. Three are worth naming:
+file permissions, and the README's own claims about all of it. Three are worth
+naming:
 
 - **the scope invariant** — every credential shape against every protocol, then
   assert that no execution or dumping flag (`-x`, `-X`, `-M`, `--sam`, `--lsa`,
@@ -400,10 +409,11 @@ tag disagrees with `salvo.__version__`, builds the wheel and sdist, attaches
 them to a GitHub Release, and publishes to PyPI.
 
 PyPI upload uses **Trusted Publishing**, so no API token is stored in this
-repository and there is nothing to leak or rotate. It needs one setup step,
-once, before the first release — on
-[PyPI → Publishing](https://pypi.org/manage/account/publishing/), add a pending
-publisher:
+repository and there is nothing to leak or rotate. That trust is already
+established — it was registered as a pending publisher before 1.0.0 and PyPI
+promoted it to an active one on first upload, so subsequent releases need no
+setup at all. The configuration it matches, for anyone forking this or
+reconstructing it:
 
 | field | value |
 |---|---|
@@ -412,6 +422,11 @@ publisher:
 | Repository name | `salvo` |
 | Workflow name | `release.yml` |
 | Environment name | `pypi` |
+
+All five must match the workflow exactly or the OIDC handshake is refused.
+A version number on PyPI is permanent and cannot be reused, even after the
+release is deleted, so if a publish ever fails on configuration, fix the
+settings and re-run the failed job rather than moving the tag.
 
 ## Credits
 

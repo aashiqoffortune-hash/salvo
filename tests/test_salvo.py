@@ -1218,6 +1218,18 @@ class TestReadmeClaims(unittest.TestCase):
         with open(os.path.join(ROOT, "README.md")) as fh:
             self.readme = fh.read()
 
+    def test_the_install_line_names_the_distribution_pyproject_publishes(self):
+        """
+        The install command is the first thing anyone runs, and it names the
+        distribution, not the command. `salvo` on PyPI is a stranger's HTTP
+        load tester, so a README that drifts from pyproject's name here does
+        not fail - it quietly installs somebody else's package.
+        """
+        with open(os.path.join(ROOT, "pyproject.toml")) as fh:
+            name = re.search(r'^name = "([^"]+)"', fh.read(), re.M).group(1)
+        self.assertIn("pipx install {}".format(name), self.readme)
+        self.assertIn("pip install --user {}".format(name), self.readme)
+
     def test_the_python_range_is_the_one_ci_actually_runs(self):
         with open(os.path.join(ROOT, ".github", "workflows", "tests.yml")) as fh:
             workflow = fh.read()

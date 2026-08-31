@@ -1769,7 +1769,14 @@ def check_nxc(nxc_bin, protocols):
     return 0
 
 
-def main():
+def build_parser():
+    """
+    The argument parser, built apart from main() so it can be read without
+    running anything. The README's options table is a second copy of this
+    list, and a second copy drifts: a test walks these actions and fails if
+    a flag exists here and not there. A flag nobody can find in the docs is
+    a flag that does not exist.
+    """
     ap = argparse.ArgumentParser(
         prog="salvo",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1903,6 +1910,12 @@ creds.txt format
                    help="with --state: ignore what is in the file, but still write to it")
     g.add_argument("--forget", action="store_true",
                    help="delete the --state file and exit")
+
+    return ap
+
+
+def main():
+    ap = build_parser()
 
     # A bare `salvo` should say what it is. Without this it falls through to
     # the targets guard and answers a first-time user with "no targets given"
